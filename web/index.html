@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>设备</title>
+<link rel="stylesheet" href="/web/style.css">
+</head>
+<body>
+
+<!-- ══════════════════════════════════════════════════════════ 设备列表页 -->
+<main class="page" id="page-list">
+
+  <header class="titlebar">
+    <span class="brand-name">设备</span>
+    <div class="spacer"></div>
+    <!-- 需求：刷新在左、退出在右，都是图标按钮 -->
+    <button class="icon-btn" id="btn-refresh" title="重新发现设备">
+      <img class="ico" src="/icon/refresh.svg" alt="刷新">
+    </button>
+    <button class="icon-btn icon-btn-danger" id="btn-quit" title="退出">
+      <img class="ico" src="/icon/exit.svg" alt="退出">
+    </button>
+  </header>
+
+  <!-- 二次确认条：页面内元素，不用阻塞 webview 线程的系统对话框 -->
+  <div class="confirm-bar" id="confirm-bar" hidden>
+    <span class="confirm-text">确认退出？</span>
+    <button class="btn btn-sm" id="btn-cancel-quit">取消</button>
+    <button class="btn btn-sm btn-danger" id="btn-confirm-quit">确认退出</button>
+  </div>
+
+  <div class="banner" id="banner" hidden>
+    <div class="banner-text">
+      <div id="banner-msg"></div>
+      <div class="banner-hint" id="banner-hint"></div>
+    </div>
+  </div>
+
+  <div class="scroll" id="list-scroll">
+    <div class="device-list" id="device-list"></div>
+
+    <div class="empty" id="list-empty" hidden>
+      <div class="empty-art" id="empty-art"></div>
+      <div class="empty-title">未检测到设备</div>
+      <div class="empty-hint" id="empty-hint">
+        请确认罗技接收器已插好、鼠标已开机。改完硬件后点右上角刷新。
+      </div>
+    </div>
+  </div>
+
+  <footer class="footbar">
+    <label class="foot-row" for="pill-switch">
+      <span class="foot-label">任务栏电量贴片</span>
+      <span class="switch" id="pill-switch" role="switch" aria-checked="false" tabindex="0">
+        <span class="switch-knob"></span>
+      </span>
+    </label>
+  </footer>
+</main>
+
+<!-- ══════════════════════════════════════════════════ 设备功能区（鼠标） -->
+<main class="page" id="page-device" hidden>
+
+  <header class="titlebar">
+    <button class="icon-btn" id="btn-back" title="返回设备列表">
+      <img class="ico" src="/icon/back.svg" alt="返回">
+    </button>
+    <span class="brand-name" id="detail-title">设备</span>
+    <div class="spacer"></div>
+    <button class="icon-btn" id="btn-refresh-detail" title="立即刷新">
+      <img class="ico" src="/icon/refresh.svg" alt="刷新">
+    </button>
+  </header>
+
+  <div class="scroll">
+    <div class="card" id="detail-device">
+      <div class="device-head">
+        <span class="dot dot-offline" id="detail-dot"></span>
+        <div class="device-head-text">
+          <div class="device-name" id="detail-name">正在读取…</div>
+          <div class="device-sub">
+            <span id="detail-link">—</span>
+          </div>
+        </div>
+        <span class="status-pill" id="detail-status">—</span>
+      </div>
+    </div>
+
+    <div class="metrics">
+      <div class="metric">
+        <div class="metric-label">电量</div>
+        <div class="battery-row">
+          <div class="battery-ring" id="battery-ring" style="--pct:0">
+            <span class="battery-ring-hole"></span>
+          </div>
+          <div class="battery-lines">
+            <div class="metric-value num" id="battery-value">—</div>
+            <div class="metric-note" id="battery-note"></div>
+            <div class="metric-badge" id="battery-badge" hidden></div>
+          </div>
+        </div>
+      </div>
+      <div class="metric">
+        <div class="metric-label">已运行</div>
+        <div class="metric-value" id="usage-value">—</div>
+      </div>
+    </div>
+
+    <div class="card" id="card-dpi">
+      <div class="card-title">
+        <span>DPI 灵敏度</span>
+        <span class="badge-inferred" id="dpi-inferred" hidden>推断值</span>
+        <div class="spacer"></div>
+        <span class="num card-title-range" id="dpi-range"></span>
+      </div>
+      <div class="dpi-head">
+        <div class="dpi-value num" id="dpi-value">—</div>
+        <div class="dpi-apply">
+          <button class="btn btn-primary" id="btn-apply-dpi">应用 DPI</button>
+        </div>
+      </div>
+      <input type="range" class="slider" id="dpi-slider" min="200" max="12000" step="50" value="1000">
+      <div class="dpi-foot">
+        <span class="num" id="dpi-min">—</span>
+        <button class="link-btn" id="btn-reset-dpi">恢复默认</button>
+        <span class="num" id="dpi-max">—</span>
+      </div>
+    </div>
+
+    <div class="card" id="card-history">
+      <div class="card-title">
+        <span>电量历史</span>
+        <div class="spacer"></div>
+        <div class="tabs" id="range-tabs">
+          <button class="tab is-on" data-range="24h">24 小时</button>
+          <button class="tab" data-range="7d">7 日</button>
+          <button class="tab" data-range="30d">30 日</button>
+        </div>
+      </div>
+      <div class="history-summary" id="history-summary">—</div>
+      <div class="chart-wrap">
+        <canvas id="history-chart" width="360" height="132"></canvas>
+        <div class="chart-empty" id="chart-empty">还没有足够的历史数据</div>
+        <div class="chart-tip" id="chart-tip" hidden></div>
+      </div>
+    </div>
+
+  </div>
+
+</main>
+
+<script src="/web/app.js"></script>
+</body>
+</html>

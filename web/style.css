@@ -1,0 +1,985 @@
+/* 样式 —— 沿用 WorkBuddy 用量悬浮窗的观感
+ *
+ * 设计约束（都是踩过的坑）：
+ *
+ *   * 浮层是无边框窗口，**四个角一律直角**：不给 body 加 border-radius。
+ *     早期版本给 body 加过 18px 圆角，结果「第一次弹出是圆的、越重绘越方」——
+ *     因为窗口本身是矩形，圆角只是 body 画出来的假象，一旦窗口尺寸变化
+ *     （前端按内容 set_height）WebView2 重绘就会露直角。统一直角最稳。
+ *   * 用户不可选中文本（user-select: none），但 DPI 输入框要能选，单独放开。
+ *   * **只有浅色一套配色**，不跟随系统深色。毛玻璃在这种无边框 WebView2 上
+ *     实测拿不到真透底（DWM 材质对 layered window 无效），与其半透明糊在
+ *     一块灰上，不如给纯白实底，对比度和可读性都更好。
+ *
+ * 注意（踩过）：这个文件是纯 CSS，**不能**带 Python 的 `# -*- coding -*-`
+ * 文件头。CSS 里 `#` 起头是 ID 选择器，那条注释会被当成选择器，连带把紧跟
+ * 其后的 `:root { --accent: ... }` 整块吃掉 —— 症状是全站颜色/圆角/按钮
+ * 样式全失效，但文字还正常显示，很难一眼看出。
+ */
+
+:root {
+  --bg: #ffffff;
+  --bg-elev: #f6f7f8;
+  --bg-sunken: #eceef0;
+  --border: #dfe3e6;
+  --text: #1c1f21;
+  --text-dim: #57606a;
+  --text-faint: #8b949e;
+  --accent: #2da44e;
+  --accent-soft: #e8f5ec;
+  --warn: #bf8700;
+  --warn-soft: #fdf5dd;
+  --danger: #cf222e;
+  --danger-soft: #ffebe9;
+  --shadow: 0 8px 28px rgba(20, 26, 33, 0.16);
+  --radius-card: 16px;
+  --radius-pill: 999px;
+
+  /* 电量分档 —— 需求要求「色值沿用现有变量，不新造一套配色」，
+     所以这四档全部由已有的 accent / warn / danger 派生。 */
+  --lv-good: #2da44e;
+  --lv-low: #bf8700;
+  --lv-critical: #d1541f;
+  --lv-empty: #cf222e;
+
+  /* 纯白实底（见文件头：不做半透明）。变量名保留 glass，避免全站替换。 */
+  --glass: #ffffff;
+  --glass-strong: #ffffff;
+  --glass-border: #e6e9ec;
+  --blur: 0px;
+  /* 设备行 hover / 选中的底色 —— 需求：悬浮时背景加深 */
+  --row-hover: #eef1f4;
+  --row-press: #e3e7eb;
+}
+
+/* ---------------------------------------------------------------- 基础 */
+
+* {
+  box-sizing: border-box;
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  overflow: hidden;
+  background: transparent;
+}
+
+body {
+  font-family: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", system-ui, sans-serif;
+  font-size: 12.5px;
+  line-height: 1.45;
+  color: var(--text);
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+  cursor: default;
+
+  /* 直角 + 纯白底（见文件头第 1、2 条） */
+  border-radius: 0;
+  background: var(--bg);
+  border: 0;
+}
+
+.num {
+  font-family: "Cascadia Mono", "Consolas", monospace;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.2px;
+}
+
+.spacer {
+  flex: 1 1 auto;
+}
+
+[hidden] {
+  display: none !important;
+}
+
+/* ---------------------------------------------------------------- 页面骨架 */
+
+.page {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+}
+
+.titlebar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  height: 40px;
+  padding: 0 10px 0 14px;
+  border-bottom: 1px solid var(--glass-border);
+  /* 可拖动：这是无边框窗口的「标题栏」，按住空白处能把窗口拖走。
+     实际移动由 Python 侧 start_drag() 走 WM_NCLBUTTONDOWN + HTCAPTION
+     交给系统做（有边缘吸附、跟手）。 */
+  cursor: grab;
+}
+
+body.dragging .titlebar {
+  cursor: grabbing;
+}
+
+/* 拖动把手：标题栏里的空白与文字区都能拖，按钮区不行 */
+.drag-handle {
+  cursor: grab;
+}
+
+body.dragging {
+  cursor: grabbing;
+}
+
+.brand-name {
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.2px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.scroll {
+  /* flex:0 1 auto —— 不撑满剩余空间，只占内容高度。
+     之前是 flex:1 1 auto，列表页只有一台设备时滚动区会把整个窗口吃满，
+     表现为「一行设备 + 一大片空白」，前端量高度也量不准（scrollHeight
+     恒等于剩余空间）。改成按内容收缩后，配合 .footbar 的 margin-top:auto
+     让贴片开关沉到底部，中间空白自然消失。 */
+  flex: 0 1 auto;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 10px 12px 12px;
+}
+
+/* 自绘细滚动条（深色下系统默认的是浅色，很丑） */
+.scroll::-webkit-scrollbar {
+  width: 8px;
+}
+.scroll::-webkit-scrollbar-thumb {
+  background: var(--text-faint);
+  border-radius: 4px;
+  opacity: 0.4;
+}
+.scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* ---------------------------------------------------------------- 按钮 */
+
+.icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: none;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s;
+}
+
+.icon-btn:hover {
+  background: var(--bg-sunken);
+  color: var(--text);
+}
+
+.icon-btn:active {
+  transform: scale(0.94);
+}
+
+.icon-btn-danger:hover {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.icon-btn.is-spinning .ico {
+  animation: spin 0.6s linear;
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.ico {
+  width: 15px;
+  height: 15px;
+  display: block;
+}
+
+/* icon/ 文件缺失时 iconFallback() 换成的内联 SVG 容器 */
+.ico-fallback {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-dim);
+}
+.ico-fallback svg {
+  width: 15px;
+  height: 15px;
+}
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 30px;
+  padding: 0 14px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--bg-elev);
+  color: var(--text);
+  font-size: 12.5px;
+  font-family: inherit;
+  cursor: pointer;
+  transition: background 0.12s, border-color 0.12s, transform 0.08s;
+}
+
+.btn:hover:not(:disabled) {
+  background: var(--bg-sunken);
+}
+
+.btn:active:not(:disabled) {
+  transform: scale(0.985);
+}
+
+.btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.btn-sm {
+  height: 26px;
+  padding: 0 10px;
+  font-size: 12px;
+}
+
+.btn-primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+  font-weight: 600;
+}
+
+.btn-primary:hover:not(:disabled) {
+  filter: brightness(1.06);
+  background: var(--accent);
+}
+
+.btn-primary.is-busy {
+  opacity: 0.65;
+}
+
+.btn-danger {
+  color: var(--danger);
+  border-color: var(--border);
+}
+
+.btn-danger:hover:not(:disabled) {
+  background: var(--danger-soft);
+}
+
+.link-btn {
+  border: none;
+  background: none;
+  color: var(--text-dim);
+  font-size: 11.5px;
+  font-family: inherit;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 6px;
+}
+
+.link-btn:hover {
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+/* ---------------------------------------------------------------- 确认条 */
+
+.confirm-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+  margin: 8px 12px 0;
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: var(--danger-soft);
+  border: 1px solid var(--danger);
+  animation: slide-down 0.14s ease-out;
+}
+
+@keyframes slide-down {
+  from { opacity: 0; transform: translateY(-4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.confirm-text {
+  flex: 1 1 auto;
+  color: var(--danger);
+  font-weight: 600;
+}
+
+/* ---------------------------------------------------------------- 提示条 */
+
+.banner {
+  display: flex;
+  gap: 8px;
+  flex: 0 0 auto;
+  margin: 8px 12px 0;
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: var(--warn-soft);
+  border: 1px solid var(--warn);
+  color: var(--text);
+}
+
+.banner-hint {
+  color: var(--text-dim);
+  font-size: 11.5px;
+  margin-top: 2px;
+}
+
+/* ---------------------------------------------------------------- 设备列表 */
+
+.device-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.device-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-card);
+  background: var(--glass-strong);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12.5px;
+  text-align: left;
+  cursor: pointer;
+  transition: border-color 0.14s, transform 0.08s, background 0.14s;
+}
+
+.device-row:hover {
+  border-color: var(--accent);
+  background: var(--row-hover);
+}
+
+.device-row:active {
+  background: var(--row-press);
+  transform: scale(0.994);
+}
+
+.device-row.is-selected {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.dev-ico {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 30px;
+  height: 30px;
+  border-radius: 9px;
+  background: var(--bg-sunken);
+  color: var(--text-dim);
+}
+
+.dev-ico img {
+  width: 17px;
+  height: 17px;
+  display: block;
+}
+
+.dev-ico svg {
+  width: 17px;
+  height: 17px;
+}
+
+.dev-main {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.dev-name {
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.dev-meta {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--text-dim);
+  font-size: 11.5px;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.dev-conn {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.dev-side {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+}
+
+.dev-pct {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+/* 电量分档配色（列表与功能区共用） */
+.lv-good     { color: var(--lv-good); }
+.lv-low      { color: var(--lv-low); }
+.lv-critical { color: var(--lv-critical); }
+.lv-empty    { color: var(--lv-empty); }
+.lv-unknown  { color: var(--text-faint); }
+
+.dev-pct.is-critical {
+  /* 需求：少于 5% 红色高亮 */
+  color: var(--lv-empty);
+  font-weight: 700;
+}
+
+/* 状态色点：在线 / 休眠 / 离线 */
+.dot {
+  display: inline-block;
+  flex: 0 0 auto;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-faint);
+}
+
+.dot-online  { background: var(--lv-good); box-shadow: 0 0 0 3px rgba(45, 164, 78, 0.16); }
+.dot-asleep  { background: var(--lv-low);  box-shadow: 0 0 0 3px rgba(191, 135, 0, 0.16); }
+.dot-offline { background: var(--text-faint); }
+
+.dot-mini {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  display: inline-block;
+  background: currentColor;
+}
+
+/* ---------------------------------------------------------------- 空态 */
+
+.empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 40px 20px;
+  text-align: center;
+  color: var(--text-dim);
+}
+
+.empty-art {
+  color: var(--text-faint);
+  opacity: 0.55;
+}
+.empty-art svg {
+  width: 44px;
+  height: 44px;
+}
+
+.empty-title {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.empty-hint {
+  font-size: 11.5px;
+  max-width: 280px;
+  line-height: 1.6;
+}
+
+/* ---------------------------------------------------------------- 卡片 */
+
+.card {
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-card);
+  background: var(--glass-strong);
+  padding: 12px;
+  margin-bottom: 10px;
+}
+
+.card-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 8px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.card-title-range {
+  color: var(--text-faint);
+  font-size: 11px;
+}
+
+/* ---------------------------------------------------------------- 设备头部 */
+
+.device-head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.device-head-text {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.device-name {
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.device-sub {
+  margin-top: 2px;
+  color: var(--text-dim);
+  font-size: 11.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sep {
+  opacity: 0.5;
+  margin: 0 3px;
+}
+
+.status-pill {
+  flex: 0 0 auto;
+  padding: 2px 8px;
+  border-radius: var(--radius-pill);
+  background: var(--bg-sunken);
+  color: var(--text-dim);
+  font-size: 11px;
+}
+
+/* ---------------------------------------------------------------- 指标 */
+
+.metrics {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.metric {
+  padding: 10px 12px;
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-card);
+  background: var(--glass-strong);
+  min-width: 0;
+}
+
+/* 待机时间独占一行（跨两列）：它是五项里唯一带口径说明的，
+   挤在半列里 note 会被 ellipsis 截掉。 */
+.metric-wide {
+  grid-column: 1 / -1;
+}
+
+.metric-label {
+  color: var(--text-dim);
+  font-size: 11.5px;
+  margin-bottom: 4px;
+}
+
+.metric-value {
+  font-size: 19px;
+  font-weight: 600;
+  line-height: 1.15;
+}
+
+.metric-note {
+  margin-top: 2px;
+  color: var(--text-faint);
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.metric-badge {
+  display: inline-block;
+  margin-top: 4px;
+  padding: 1px 6px;
+  border-radius: var(--radius-pill);
+  background: var(--warn-soft);
+  color: var(--warn);
+  font-size: 10px;
+}
+
+.battery-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.battery-lines {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+/* 环形电量：conic-gradient 由 --pct 驱动。
+   **必须**按 1% 精度画（calc(var(--pct) * 1%)），
+   不许写成 round/floor 到 5 的台阶（需求 Q2 明确禁止）。 */
+.battery-ring {
+  position: relative;
+  flex: 0 0 auto;
+  width: 38px;
+  height: 38px;
+  border-radius: 50%;
+  background: conic-gradient(var(--lv-good) calc(var(--pct) * 1%), var(--bg-sunken) 0);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.2s;
+}
+
+.battery-ring.is-low {
+  background: conic-gradient(var(--lv-low) calc(var(--pct) * 1%), var(--bg-sunken) 0);
+}
+
+.battery-ring.is-critical {
+  background: conic-gradient(var(--lv-empty) calc(var(--pct) * 1%), var(--bg-sunken) 0);
+}
+
+.battery-ring.is-unknown {
+  background: var(--bg-sunken);
+}
+
+/* 取不到值的数字（待机时间失败等）退成灰，别当成真读数 */
+.metric-value.is-faint {
+  color: var(--text-faint);
+  font-weight: 500;
+}
+
+.battery-ring-hole {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  background: var(--glass-strong);
+}
+
+/* ---------------------------------------------------------------- DPI */
+
+.dpi-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+
+.dpi-value {
+  font-size: 26px;
+  font-weight: 600;
+  line-height: 1.1;
+}
+
+.dpi-apply {
+  flex: 1 1 auto;
+  display: flex;
+  justify-content: flex-end;
+}
+
+.slider {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 4px;
+  margin: 6px 0;
+  border-radius: 2px;
+  background: var(--bg-sunken);
+  outline: none;
+  cursor: pointer;
+}
+
+.slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 2px solid var(--glass-strong);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.25);
+  cursor: grab;
+}
+
+.slider:active::-webkit-slider-thumb {
+  cursor: grabbing;
+  transform: scale(1.1);
+}
+
+.slider:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.dpi-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  color: var(--text-faint);
+  font-size: 11px;
+}
+
+.badge-inferred {
+  padding: 1px 6px;
+  border-radius: var(--radius-pill);
+  background: var(--warn-soft);
+  color: var(--warn);
+  font-size: 10px;
+  font-weight: 500;
+}
+
+/* ---------------------------------------------------------------- 历史图 */
+
+.tabs {
+  display: inline-flex;
+  gap: 2px;
+  padding: 2px;
+  border-radius: 8px;
+  background: var(--bg-sunken);
+}
+
+.tab {
+  border: none;
+  background: none;
+  padding: 2px 8px;
+  border-radius: 6px;
+  color: var(--text-dim);
+  font-family: inherit;
+  font-size: 11px;
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s;
+}
+
+.tab:hover {
+  color: var(--text);
+}
+
+.tab.is-on {
+  background: var(--glass-strong);
+  color: var(--text);
+  font-weight: 600;
+}
+
+.history-summary {
+  color: var(--text-dim);
+  font-size: 11.5px;
+  margin-bottom: 6px;
+}
+
+.chart-wrap {
+  position: relative;
+  width: 100%;
+}
+
+#history-chart {
+  display: block;
+  width: 100%;
+  height: 132px;
+}
+
+.chart-empty {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-faint);
+  font-size: 11.5px;
+  pointer-events: none;
+}
+
+.chart-tip {
+  position: absolute;
+  z-index: 5;
+  padding: 4px 7px;
+  border-radius: 6px;
+  background: var(--text);
+  color: var(--bg);
+  font-size: 10.5px;
+  line-height: 1.4;
+  white-space: nowrap;
+  pointer-events: none;
+  box-shadow: var(--shadow);
+}
+
+/* ---------------------------------------------------------------- 开关 */
+
+.switch-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.footbar {
+  flex: 0 0 auto;
+  /* 与 .scroll 的 flex:0 1 auto 配合：窗口比内容高时，把这一条推到最底部，
+     而不是在中间留白。窗口被前端拉动到刚好内容高度时这两者等价。 */
+  margin-top: auto;
+  padding: 8px 14px 10px;
+  border-top: 1px solid var(--glass-border);
+}
+
+.foot-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+}
+
+.foot-label {
+  flex: 1 1 auto;
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
+.switch-label {
+  flex: 0 0 auto;
+  font-size: 12.5px;
+}
+
+.switch-hint {
+  flex: 1 1 auto;
+  text-align: right;
+  color: var(--text-faint);
+  font-size: 11px;
+}
+
+.switch {
+  position: relative;
+  flex: 0 0 auto;
+  display: inline-block;
+  width: 34px;
+  height: 20px;
+  border-radius: var(--radius-pill);
+  background: var(--bg-sunken);
+  border: 1px solid var(--border);
+  cursor: pointer;
+  transition: background 0.16s, border-color 0.16s;
+}
+
+.switch.on {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.switch.disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.switch-knob {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
+  transition: transform 0.16s ease;
+}
+
+.switch.on .switch-knob {
+  transform: translateX(14px);
+}
+
+/* ---------------------------------------------------------------- 底部说明 */
+
+.detail-foot {
+  flex: 0 0 auto;
+  padding: 6px 14px 8px;
+  color: var(--text-faint);
+  font-size: 10.5px;
+  text-align: center;
+  border-top: 1px solid var(--glass-border);
+}
+
+/* ---------------------------------------------------------------- 贴片页 */
+
+body.pill-page {
+  border-radius: 10px;
+  background: var(--glass);
+}
+
+.pill-wrap {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 100%;
+  padding: 0 8px;
+  overflow: hidden;
+}
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 7px;
+  border-radius: var(--radius-pill);
+  background: var(--glass-strong);
+  border: 1px solid var(--glass-border);
+  cursor: pointer;
+  font-size: 11px;
+  white-space: nowrap;
+  transition: border-color 0.12s;
+}
+
+.pill:hover {
+  border-color: var(--accent);
+}
+
+.pill-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.pill-pct {
+  font-family: "Cascadia Mono", "Consolas", monospace;
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+
+.pill-more {
+  color: var(--text-faint);
+  font-size: 10.5px;
+  padding: 0 2px;
+}

@@ -1,0 +1,18 @@
+# 鼠标信息小窗 —— Python 依赖
+#
+# 安装（注意 pywebview 必须 --no-deps 单独装，否则 pip 会去拉 pyobjc 然后报
+# "PyObjC requires macOS to build"）：
+#
+#   python -m pip install --no-deps pywebview
+#   python -m pip install pywin32
+#   python -m pip install hidapi
+#
+# WebView2 Runtime 由 Windows 10/11 与新版 Edge 自带，一般无需安装。
+# 打包 exe 还需要：python -m pip install pyinstaller
+
+pywebview>=5.0          # 窗口载体（Windows 上走 EdgeChromium / WebView2）
+pywin32>=305            # 系统托盘（Shell_NotifyIcon）与开机自启（注册表）
+hidapi>=0.14            # 与罗技接收器通信（HID++ 2.0 长报文）。装不上见 README
+
+# 可选
+pyinstaller>=6.0        # 只有打单文件 exe 时需要

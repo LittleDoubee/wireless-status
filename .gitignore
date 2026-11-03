@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# PyInstaller：产物目录忽略，但保留 .spec（别人要复现打包）
+build/
+dist/
+
+# 运行日志
+logs/
+*.log
+
+# 运行期产生的状态（每台机器不同，不要提交）
+config.json
+window_state.json
+battery_history.json
+usage_stats.json
+
+# 编辑器
+.vscode/
+.idea/
+
+# 备份/临时文件
+*.bak
+*.tmp
+_probe.txt
+
+# 文档截图（含本机运行痕迹：设备型号、电量、使用时长、任务栏其它图标）
+docs/images/
