@@ -245,7 +245,7 @@
     safe(callApi("set_config", ["last_selected_device", key]), null);
 
     // 切页后内容高度完全不同（功能区比列表高不少），重新量一次
-    requestAnimationFrame(function () { fitHeight(lastSnap); });
+    refitNow();
   }
 
   function backToList() {
@@ -259,7 +259,7 @@
     clearInterval(historyTimer);
     historyTimer = null;
 
-    requestAnimationFrame(function () { fitHeight(lastSnap); });
+    refitNow();
   }
 
   function findDevice(key) {
@@ -875,7 +875,24 @@
   var _lastWant = -1;
   var _wantHits = 0;
 
-  function fitHeight(snap) {
+  // 页切换时立刻重排一次，不受「连续两帧」判定阻挡 —— 切页是唯一能确定
+  // 「内容高度必然变了」的时刻，而且此时 DOM 已经插好（openDevice/backToList
+  // 都是先改 hidden 再调这里），没必要再等一轮轮询。等两帧的旧写法会让
+  // 动画比点击晚最多 1 秒才起步（实测 602ms），观感是「点了没反应，然后突然
+  // 长上去」。
+  function refitNow() {
+    var want = measureContent();
+    if (want === undefined) { return; }
+    _lastWant = want;
+    _wantHits = 2;
+    if (Math.abs(want - _reportedHeight) < 2) { return; }
+    _reportedHeight = want;
+    if (api && api.set_height) {
+      api.set_height(want).then(function () {}).catch(function () {});
+    }
+  }
+
+  function measureContent() {
     // 贴片页不参与（它是固定 200x28 的小窗）
     if (document.body.classList.contains("pill-page")) { return; }
 
@@ -891,7 +908,12 @@
       }
     });
     // 滚动区自带上下 padding，这里只补一点呼吸位（body 已无边框）
-    var want = Math.ceil(content + fixed + 2);
+    return Math.ceil(content + fixed + 2);
+  }
+
+  function fitHeight(snap) {
+    var want = measureContent();
+    if (want === undefined) { return; }
 
     // 稳定性判定：同一数值连续两次才采纳。
     if (want === _lastWant) {

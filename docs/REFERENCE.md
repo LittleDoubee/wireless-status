@@ -779,6 +779,26 @@ copy usage_stats.json     D:\tools\mouse\
   窗口失焦这些路径上不触发，表现就是「移开了也不收」。
 * **位置不漂**：底边钉死在任务栏上沿往上长；`x` 算出后锁进 `_fixed_x` 复用；
   「已应用高度」与前端上报高度分开存，避免首帧误报把窗口压塌。
+* **高度变化有过渡**：`set_height()` 不直接改窗口，而是把目标交给
+  `main.py _anim_loop()` 的动画线程，180 ms ease-out cubic 逐帧 `SetWindowPos`
+  （约 6 帧）。起跳高度读**真实窗口矩形**（`_real_height()`）而非目标值，
+  中途换目标就从当前高度重新计时，不会堆线程。底边每帧都用
+  `py = round((y+h)*scale) - ph` 反推，所以整个过程底边一动不动、只往上长。
+* **DPI 倍率必须稳**：`dpi_scale()` 曾只走 `GetDC(0)` + `GetDeviceCaps` 且没
+  声明 `argtypes`/`restype`，64 位下 HDC 被当 `c_int` 截断 → 偶发
+  `OverflowError: int too long to convert` → 整个函数 except 返回 **1.0**。
+  于是坐标按 1.0 算、`move_resize` 又乘 1.5，窗口就有一半跑到屏幕外（x 3228 /
+  屏幕 2560）。现在优先用不碰句柄的 `GetDpiForSystem()`，`GetDeviceCaps` 只
+  作兜底且补齐类型声明；`move_resize(clamp=True)` 再在 `SetWindowPos` 之前把
+  矩形硬夹进显示器范围，保证任何上游算错都不会把窗口丢出屏幕。
+* **溢出面板避让**：点 ^ 弹出的托盘溢出面板（类名
+  `TopLevelWindowForOverflowXamlIsland`）也从任务栏往上长，会盖住窗口下半截。
+  `winui.overflow_panel_rect()` 用 `IsWindowVisible` 判它是否弹出（这个窗口
+  一直存在，只能看可见性），弹出时把底边改钉在面板上沿再减 `TASKBAR_MARGIN`，
+  实测窗口从 `(1971,1263,2559,1515)` 上移到 `(1971,1092,2559,1344)`，
+  底边 1344 / 面板顶 1357，留 13 物理像素间隙。`main.py _poll_panel_state()`
+  在命令泵里每次比一次开合状态，一变就重排 —— 所以弹出瞬间就避让，而不是等
+  下次显示；面板收回后同样自动落回原位。
 * **托盘**：左键单击 = 显示窗口（不再切换）；右键菜单 = 立即刷新 / 开机自启 /
   退出。「显示」这一项已从菜单删掉，因为左键就是显示。
 * **启动静默**：双击 `start.bat` 或 exe 都只在托盘出现，不弹窗口、不闪控制台

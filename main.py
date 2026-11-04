@@ -79,6 +79,12 @@ MAIN_HEIGHT = 588          # 初始高度，之后由前端 set_height() 按内�
 MIN_HEIGHT = 168
 MAX_HEIGHT = 760
 
+#: 高度变化的动画时长（秒）与帧间隔。用户要求「从列表到详情，高度变大的过程
+#: 要有动画，看起来更顺畅」。180ms 是肉眼刚好能看出是「长上去」而不至于
+#: 让人等的一档；16ms ≈ 60fps。
+ANIM_MS = 180
+ANIM_FRAME_SEC = 0.016
+
 #: 贴片尺寸（逻辑像素）。
 #:
 #: 宽 200 是**窗口**宽度 —— 胶囊本身只有内容那么宽，靠右贴住托盘图标，
@@ -240,21 +246,60 @@ def dpi_scale():
 
     为什么要它：进程声明 DPI 感知后，Win32 的坐标 API 都返回**物理像素**，
     而 pywebview（WinForms）用的是**逻辑像素**。两者相差正好是这个倍率。
+
+    ⚠ 这里曾经只走 ``GetDC(0)`` + ``GetDeviceCaps`` 一条路，而这两个函数
+    **没有声明 argtypes/restype**：64 位下 HDC 是指针，ctypes 默认按
+    ``c_int`` 收发，句柄被截断，``GetDeviceCaps`` / ``ReleaseDC`` 偶发抛
+    ``OverflowError: int too long to convert``，整个函数掉进 except 返回
+    **1.0**。于是 ``main_rect()`` 按 1.0 算出一套逻辑坐标，``move_resize``
+    又乘 1.5 变成物理坐标：横向 2152 逻辑 → 3228 物理（屏幕才 2560 宽），
+    纵向 1352 逻辑 → 2028 物理（屏幕才 1600 高）。用户看到的就是
+    「打开后位置错位、会漂移、有时候一半超出右边屏幕」。
+
+    所以现在优先走**不碰句柄**的 ``GetDpiForSystem``（150% 缩放返回 144），
+    它返回的正是系统 DPI，也正好是 WinForms 做逻辑坐标换算的倍率。次选
+    ``GetDpiForWindow(桌面窗口)``。``GetDC`` 那条路降为最后兜底，并且补齐
+    了 argtypes/restype。
     """
     try:
-        hdc = ctypes.windll.user32.GetDC(0)
+        dpi = int(ctypes.windll.user32.GetDpiForSystem())
+        if dpi > 0:
+            return float(dpi) / 96.0
+    except Exception:
+        pass
+
+    try:
+        desk = ctypes.windll.user32.GetDesktopWindow()
+        dpi = int(ctypes.windll.user32.GetDpiForWindow(ctypes.c_void_p(desk)))
+        if dpi > 0:
+            return float(dpi) / 96.0
+    except Exception:
+        pass
+
+    # 最后兜底：GetDeviceCaps。必须显式声明类型，否则就是上面说的截断问题。
+    try:
+        user32 = ctypes.windll.user32
+        gdi32 = ctypes.windll.gdi32
+        user32.GetDC.restype = ctypes.c_void_p
+        user32.GetDC.argtypes = [ctypes.c_void_p]
+        user32.ReleaseDC.restype = ctypes.c_int
+        user32.ReleaseDC.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        gdi32.GetDeviceCaps.restype = ctypes.c_int
+        gdi32.GetDeviceCaps.argtypes = [ctypes.c_void_p, ctypes.c_int]
+
+        hdc = user32.GetDC(None)
         if not hdc:
             return 1.0
         try:
             LOGPIXELSX = 88
-            dpi = ctypes.windll.gdi32.GetDeviceCaps(hdc, LOGPIXELSX)
+            dpi = gdi32.GetDeviceCaps(hdc, LOGPIXELSX)
         finally:
-            ctypes.windll.user32.ReleaseDC(0, hdc)
-        if not dpi:
-            return 1.0
-        return float(dpi) / 96.0
+            user32.ReleaseDC(None, hdc)
+        if dpi:
+            return float(dpi) / 96.0
     except Exception:
-        return 1.0
+        pass
+    return 1.0
 
 
 def screen_work_area():
@@ -492,6 +537,14 @@ class WirelessStatusApp(object):
         self._applied_height = MAIN_HEIGHT
         #: 是否正在拖动。拖动时不做「指针离开就收起」的判定。
         self._dragging = False
+        #: 托盘溢出面板（^ 弹出的那块）上一次的开合状态。None = 还没测过。
+        #: 见 ``_poll_panel_state``：状态一变就重排主窗，避免面板盖住窗口。
+        self._panel_open = None
+        #: 高度动画的目标值 / 是否已有动画线程在跑 / 保护这两个字段的锁。
+        #: 见 ``_animate_to``：动画期间又来了新目标就只改目标值，不另起线程。
+        self._anim_target = None
+        self._anim_running = False
+        self._anim_lock = threading.Lock()
         #: 一次性信号：下次取快照时让前端退回设备列表页（需求 4）。
         #: ``show_window`` 置 True，``snapshot`` 消费后清掉。
         self._want_list = False
@@ -849,6 +902,10 @@ class WirelessStatusApp(object):
                     # 空闲时顺手做点维护：历史抽稀、用量落盘
                     self._housekeeping()
                     try:
+                        self._poll_panel_state()
+                    except Exception:
+                        pass
+                    try:
                         self._poll_cursor_leave()
                     except Exception:
                         pass
@@ -858,6 +915,10 @@ class WirelessStatusApp(object):
                 except Exception:
                     traceback.print_exc()
                 # 有命令也在判：用户可能是点了按钮又把鼠标甩出去的
+                try:
+                    self._poll_panel_state()
+                except Exception:
+                    pass
                 try:
                     self._poll_cursor_leave()
                 except Exception:
@@ -929,6 +990,32 @@ class WirelessStatusApp(object):
             self.history.save()
         except Exception:
             pass
+
+    def _poll_panel_state(self):
+        """托盘溢出面板（^ 弹出的那块）状态变了就重排主窗（用户需求）。
+
+        主窗底边原本钉在任务栏上沿，面板一弹出来就盖住窗口下半截，Windows
+        还会把窗口往上顶 —— 用户看到的「界面漂移」就是它。``main_rect()``
+        已经会避让，这里只负责**发现面板开合**并触发一次重排。
+
+        只在窗口可见时做（藏起来时不用管，下次 ``show_window`` 会重算）。
+        面板宽高不变、只切可见性，所以状态变化就是一个 bool。
+        """
+        if not self._visible:
+            self._panel_open = None
+            return
+        try:
+            open_now = winui.overflow_panel_rect() is not None
+        except Exception:
+            return
+        prev = getattr(self, "_panel_open", None)
+        self._panel_open = open_now
+        if prev is None or prev == open_now:
+            return
+        try:
+            self._reposition()
+        except Exception:
+            traceback.print_exc()
 
     def _poll_cursor_leave(self):
         """指针离开主窗满 ``AUTO_HIDE_SEC`` 就自动收起（需求 3）。
@@ -1043,6 +1130,17 @@ class WirelessStatusApp(object):
             bar_top = int(bar[1] / scale)
         if bar_top is None:
             bar_top = top + sh
+
+        # 「显示隐藏的图标」面板弹出来时，它有可能会挡在上面，所以要再往上让。
+        # 面板未弹出时这一步是空操作，与原来行为完全一致。
+        # 已找到面板窗口类名 TopLevelWindowForOverflowXamlIsland（Win11），
+        # 靠 IsWindowVisible 判断开合。见 winui.overflow_panel_rect 的注释。
+        panel = winui.overflow_panel_rect()
+        if panel:
+            panel_top = int(panel[1] / scale)
+            if panel_top < bar_top:
+                bar_top = panel_top
+
         fixed_x = getattr(self, "_fixed_x", None)
 
         # ---- 1) 用户拖过：沿用保存的 x（y 仍按任务栏上沿反推）
@@ -1247,7 +1345,7 @@ class WirelessStatusApp(object):
                 w, h, x, y = self.main_rect(
                     height=getattr(self, "_applied_height", MAIN_HEIGHT))
                 self._lock_x(x)
-                winui.move_resize(hwnd, x, y, w, h)
+                winui.move_resize(hwnd, x, y, w, h, clamp=True)
             except Exception:
                 traceback.print_exc()
 
@@ -1287,6 +1385,10 @@ class WirelessStatusApp(object):
         窗口再也收不回去。判断「量得准不准」只有前端知道（它能看 DOM、
         能等两帧），所以稳定性判定放在 ``web/app.js`` 的 ``fitHeight``；
         后端只保证「按收到的值摆好，并且横向不动」。
+
+        高度变化走**动画**（``_animate_to``）：用户要求从列表点进详情时
+        窗口「长上去」的过程要顺畅。这里立刻返回，动画在独立线程里逐帧
+        ``SetWindowPos``，不阻塞调用方（js_api 那边等着回复的）。
         """
         try:
             h = int(height)
@@ -1298,23 +1400,105 @@ class WirelessStatusApp(object):
             return {"ok": True, "height": self._cur_height, "changed": False}
         self._cur_height = h
         self._applied_height = h
-        hwnd = self._main_hwnd()
-        if hwnd:
-            try:
-                # 高度变了要重算整块矩形：窗口是「底边贴任务栏、往上长」，
-                # 只改高度不改 y 的话会压进任务栏里。
-                # x 复用锁定的值，所以「切换设备 → 列表变长 → 高度变」时
-                # 窗口只往上长，横向一动不动（需求 1）。
-                w, hh, x, y = self.main_rect(height=h)
-                self._lock_x(x)
-                winui.move_resize(hwnd, x, y, w, hh)
-                # 纯 Win32 的 SetWindowPos 不带 SWP_SHOWWINDOW，理论上不会
-                # 改变显隐；仍补一句兜底，防止别的代码路径把窗口带出来。
-                self._restore_visibility()
-            except Exception:
-                traceback.print_exc()
-                return {"ok": False, "error": "调整窗口高度失败"}
+        self._animate_to(h)
         return {"ok": True, "height": h, "changed": True}
+
+    # ---- 高度动画
+
+    def _animate_to(self, target):
+        """把主窗高度平滑过渡到 ``target``（逻辑像素）。
+
+        为什么不在 ``set_height`` 里直接 ``move_resize``：一步到位会让窗口
+        「啪」地跳一下，用户明确要求加过渡。为什么不在前端做：窗口高度是
+        Win32 的，CSS 只能改内容、改不了外框，抖起来会露出背景。
+
+        动画期间又来了新目标（用户连点两台设备）不会另起线程，循环会读到
+        新目标并从**当前真实高度**重新计时，所以不会打架、也不会堆线程。
+        """
+        target = int(target)
+        with self._anim_lock:
+            self._anim_target = target
+            if self._anim_running:
+                return
+            self._anim_running = True
+        threading.Thread(target=self._anim_loop, name="h-anim",
+                         daemon=True).start()
+
+    def _anim_loop(self):
+        try:
+            while True:
+                with self._anim_lock:
+                    target = self._anim_target
+                if target is None:
+                    break
+                start = self._real_height()
+                if abs(target - start) < 2:
+                    self._apply_height(target, restore=False)
+                    with self._anim_lock:
+                        if self._anim_target == target:
+                            self._anim_target = None
+                            break
+                    continue
+
+                t0 = time.time()
+                duration = ANIM_MS / 1000.0
+                retarget = False
+                while True:
+                    with self._anim_lock:
+                        if self._anim_target != target:
+                            retarget = True
+                            break
+                    p = min(1.0, (time.time() - t0) / duration)
+                    eased = 1.0 - (1.0 - p) ** 3      # ease-out cubic
+                    self._apply_height(int(round(start + (target - start) * eased)),
+                                       restore=False)
+                    if p >= 1.0:
+                        break
+                    time.sleep(ANIM_FRAME_SEC)
+
+                if retarget:
+                    continue
+
+                self._apply_height(target)
+                with self._anim_lock:
+                    if self._anim_target == target:
+                        self._anim_target = None
+                        break
+        except Exception:
+            traceback.print_exc()
+        finally:
+            with self._anim_lock:
+                self._anim_running = False
+
+    def _real_height(self):
+        """主窗**当前真实**高度（逻辑像素）。动画起点用它，避免用目标值起跳。"""
+        hwnd = self._main_hwnd()
+        rect = winui.window_rect(hwnd) if hwnd else None
+        if rect:
+            scale = dpi_scale() or 1.0
+            h = int(round((rect[3] - rect[1]) / scale))
+            if h > 0:
+                return h
+        return int(getattr(self, "_cur_height", MAIN_HEIGHT))
+
+    def _apply_height(self, h, restore=True):
+        """按高度 ``h`` 摆好主窗（保持底边贴任务栏、横向不动）。
+
+        ``restore=False`` 供动画的中间帧用：那些帧不需要（也不应该）反复
+        ``ShowWindow``，否则每 16ms 激活一次窗口，用户正在打字的窗口会被
+        抢焦点。
+        """
+        hwnd = self._main_hwnd()
+        if not hwnd:
+            return
+        try:
+            w, hh, x, y = self.main_rect(height=h)
+            self._lock_x(x)
+            winui.move_resize(hwnd, x, y, w, hh, clamp=True)
+            if restore:
+                self._restore_visibility()
+        except Exception:
+            traceback.print_exc()
 
     def show_window(self):
         """显示主窗。
@@ -1361,7 +1545,7 @@ class WirelessStatusApp(object):
             w, h, x, y = self.main_rect(
                 height=getattr(self, "_applied_height", MAIN_HEIGHT))
             self._lock_x(x)
-            winui.move_resize(hwnd, x, y, w, h)
+            winui.move_resize(hwnd, x, y, w, h, clamp=True)
             winui.show_window(hwnd)
             self._set_topmost(hwnd)
         except Exception:

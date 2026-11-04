@@ -262,6 +262,19 @@ def main_rect_near_icon(anchor, width, height, gap=8):
             bar_top = wb                 # 兜底：贴工作区底边
 
     y = bar_top - h - int(gap)
+
+    # 避让「显示隐藏的图标」溢出面板（用户需求）。
+    #
+    # 面板没弹出时底边钉在任务栏上沿；一旦 ^ 弹出，面板正好从任务栏往上
+    # 长（实测 1986,1357,2337,1528），会盖住窗口下半截，Windows 还会为了
+    # 不让两个窗口抢同一块区域把窗口往上顶 —— 表象就是「界面漂移」。
+    # 所以面板可见时把底边改钉在面板上沿，窗口整体上移，两者互不遮挡。
+    panel = overflow_panel_rect()
+    if panel:
+        panel_top = int(panel[1] / scale)
+        if panel_top < bar_top:
+            y = panel_top - h - int(gap)
+
     flipped = False
     if y < wt:
         # 上方放不下（窗口太高 / 任务栏在上方）：翻到图标下方
@@ -767,6 +780,60 @@ def taskbar_rect():
         return None
 
 
+# 「显示隐藏的图标」溢出面板的窗口类名（Win11 22H2 起实测）。
+#
+# 名字看起来很怪，但这是 Windows 自己起的：这个类名的窗口就是点任务栏
+# 那个 ^ 箭头之后弹出来的托盘溢出面板（标题「系统托盘溢出窗口。」）。
+# Win10/更早的 21H2 上没有这个类名，此时函数返回 None，调用方退回旧行为
+# （只按任务栏上沿算，不避让面板）。
+OVERFLOW_PANEL_CLASSES = (
+    "TopLevelWindowForOverflowXamlIsland",
+    "TopLevelWindowForOverflowXamlIsland_WASDK",
+    "NotifyIconOverflowWindow",          # Win10 经典实现
+)
+
+
+def overflow_panel_rect():
+    """托盘溢出面板（^ 弹出的那块）的屏幕矩形（**物理像素**）。
+
+    返回 ``(left, top, right, bottom)``；**面板没弹出时返回 None**。
+
+    为什么要它（用户需求）：主窗底边一直钉在任务栏上沿，可溢出面板
+    正好也从任务栏往上长 —— 面板一弹出来就会盖住主窗下半截，Windows
+    为了不让两个窗口抢同一块区域还会把主窗往上顶，用户看到的就是
+    「界面漂移」。所以主窗必须避让：面板可见时，底边改钉在面板上沿。
+
+    判定用 ``IsWindowVisible`` —— 实测这个窗口一直存在（矩形固定
+    1986,1357,2337,1528），点 ^ 就是把它的可见性来回切：
+    ``vis=False → True → False``。所以**不能**靠「窗口存在」判断。
+    """
+    if not IS_WINDOWS:
+        return None
+    try:
+        import ctypes
+        import ctypes.wintypes as wt
+
+        user32 = ctypes.windll.user32
+        user32.FindWindowW.restype = wt.HWND
+        for cls in OVERFLOW_PANEL_CLASSES:
+            hwnd = user32.FindWindowW(cls, None)
+            if not hwnd:
+                continue
+            if not user32.IsWindowVisible(hwnd):
+                continue
+            rect = wt.RECT()
+            if not user32.GetWindowRect(ctypes.c_void_p(hwnd),
+                                        ctypes.byref(rect)):
+                continue
+            # 空矩形（有些版本会用 0x0 占位）不算数
+            if rect.right <= rect.left or rect.bottom <= rect.top:
+                continue
+            return (rect.left, rect.top, rect.right, rect.bottom)
+        return None
+    except Exception:
+        return None
+
+
 def pill_rect(pill_width, pill_height, margin=2):
     """任务栏电量贴片的位置：**贴在通知区域左边**，与托盘图标同一行居中。
 
@@ -1173,19 +1240,47 @@ def _dpi_scale():
 
     为什么不直接复用 ``main.dpi_scale()``：那会造成 winui ↔ main 循环导入
     （main 在模块级就已经 ``import winui``）。这里自己读一遍，算法保持一致。
+
+    ⚠ 与 ``main.dpi_scale()`` 同一个坑：``GetDC`` / ``GetDeviceCaps`` 不声明
+    类型时 HDC 会被截断，``ReleaseDC`` 偶发 ``OverflowError: int too long to
+    convert``，于是这里返回 1.0，``move_resize`` 少乘 1.5 → 窗口只有设计尺寸
+    的 2/3 并整体偏向左上。改成优先 ``GetDpiForSystem``（不碰句柄）。
     """
     if not IS_WINDOWS:
         return 1.0
+    import ctypes
+
     try:
-        import ctypes
-        hdc = ctypes.windll.user32.GetDC(0)
+        dpi = int(ctypes.windll.user32.GetDpiForSystem())
+        if dpi > 0:
+            return float(dpi) / 96.0
+    except Exception:
+        pass
+    try:
+        desk = ctypes.windll.user32.GetDesktopWindow()
+        dpi = int(ctypes.windll.user32.GetDpiForWindow(ctypes.c_void_p(desk)))
+        if dpi > 0:
+            return float(dpi) / 96.0
+    except Exception:
+        pass
+    try:
+        user32 = ctypes.windll.user32
+        gdi32 = ctypes.windll.gdi32
+        user32.GetDC.restype = ctypes.c_void_p
+        user32.GetDC.argtypes = [ctypes.c_void_p]
+        user32.ReleaseDC.restype = ctypes.c_int
+        user32.ReleaseDC.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        gdi32.GetDeviceCaps.restype = ctypes.c_int
+        gdi32.GetDeviceCaps.argtypes = [ctypes.c_void_p, ctypes.c_int]
+
+        hdc = user32.GetDC(None)
         if not hdc:
             return 1.0
         try:
             LOGPIXELSX = 88
-            dpi = ctypes.windll.gdi32.GetDeviceCaps(hdc, LOGPIXELSX)
+            dpi = gdi32.GetDeviceCaps(hdc, LOGPIXELSX)
         finally:
-            ctypes.windll.user32.ReleaseDC(0, hdc)
+            user32.ReleaseDC(None, hdc)
         return (float(dpi) / 96.0) if dpi else 1.0
     except Exception:
         return 1.0
@@ -1334,10 +1429,41 @@ def cursor_pos():
     return None
 
 
-def move_resize(hwnd, x, y, w, h):
+def _clamp_to_monitor(px, py, pw, ph):
+    """把物理像素矩形夹进它所在显示器的**整块**屏幕范围，返回新的 ``(px, py)``。
+
+    为什么需要这一步（用户报「有时候有一半超出右边屏幕」）：横向位置是
+    「图标中心 - 窗口宽/2」算出来的，一旦 ``dpi_scale()`` 拿到错误的值、
+    或者锚点坐标是别的显示器的，算出来的 x 就可能落在屏幕外。与其在上游
+    猜哪一步错了，不如在最后一道关口 ``SetWindowPos`` 之前硬夹一次 ——
+    无论前面怎么算，窗口都不会跑到看不见的地方去。
+
+    用**整块屏幕**而不是工作区：窗口本来就贴在任务栏上方，用工作区夹会
+    让它在任务栏横向让位时被额外推走。
+    """
+    mon = monitor_rect_for_point(px + pw // 2, py + ph // 2)
+    if not mon:
+        return px, py
+    left, top, right, bottom = mon
+    if pw >= right - left:
+        px = left
+    else:
+        px = max(left, min(px, right - pw))
+    if ph >= bottom - top:
+        py = top
+    else:
+        py = max(top, min(py, bottom - ph))
+    return px, py
+
+
+def move_resize(hwnd, x, y, w, h, clamp=False):
     """移动并缩放窗口，纯 Win32（不经过 pywebview，理由同 show_window）。
 
     参数是**逻辑像素**，函数内部按 ``_dpi_scale()`` 换算成物理像素。
+
+    ``clamp=True`` 时在 ``SetWindowPos`` 之前把矩形硬夹进显示器范围，
+    保证窗口永远不会有一半跑到屏幕外（见 ``_clamp_to_monitor``）。
+    贴片窗**不要**传 True：它是任务栏的子窗口，坐标是相对宿主的。
 
     ⚠ 这里踩过一个很隐蔽的坑（2026-11-02）：``SetWindowPos`` 收的是
     **物理像素**，而本模块的 ``pill_rect()`` 和 main 里的 ``main_rect()``
@@ -1354,10 +1480,21 @@ def move_resize(hwnd, x, y, w, h):
     try:
         import ctypes
         scale = _dpi_scale() or 1.0
+        px = int(round(x * scale))
+        pw = max(1, int(round(w * scale)))
+        ph = max(1, int(round(h * scale)))
+        if clamp:
+            # **底边取整**而不是顶边取整：主窗是「底边钉在任务栏上沿、只往上
+            # 长」，顶边和高度各自 round 会让底边在 ±1 物理像素之间抖（实测
+            # 切页动画里出现过 1515 / 1516 交替），肉眼就是窗口底边轻轻颤动。
+            # 先按底边定位再回推顶边，底边就严格对齐 round((y+h)*scale)。
+            py = int(round((y + h) * scale)) - ph
+            px, py = _clamp_to_monitor(px, py, pw, ph)
+        else:
+            py = int(round(y * scale))
         ctypes.windll.user32.SetWindowPos(
             ctypes.c_void_p(hwnd), None,
-            int(round(x * scale)), int(round(y * scale)),
-            max(1, int(round(w * scale))), max(1, int(round(h * scale))),
+            px, py, pw, ph,
             SWP_NOZORDER | SWP_NOACTIVATE)
         return True
     except Exception:
