@@ -28,3 +28,5 @@ _probe.txt
 
 # 文档截图（含本机运行痕迹：设备型号、电量、使用时长、任务栏其它图标）
 docs/images/
+node_modules/
+node_modules.orig/

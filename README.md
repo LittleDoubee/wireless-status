@@ -54,7 +54,7 @@ Alt+Tab 里看不到它，也不产生任务栏按钮、点它不抢焦点。
 
 ### 直接用 exe
 
-从 [Releases](../../releases) 下载 `WirelessStatus.exe`，双击即可。
+从 [Releases](https://github.com/LittleDoubee/wireless-status/releases) 下载 `WirelessStatus.exe`，双击即可。
 目标机器**不需要装 Python**，首次运行会在 exe 同目录生成四个 json 配置。
 
 ### 从源码跑
