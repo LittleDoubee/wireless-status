@@ -888,13 +888,16 @@ def pill_rect_in_taskbar(pill_width, pill_height):
     返回 ``(x, y, w, h, bar_h)``：
 
       * ``x, y`` —— 屏幕坐标（``embed_in_taskbar`` 会自己减掉任务栏原点）
-      * ``w`` —— 贴片宽（逻辑像素乘倍率，150% 下胶囊大小才一致）
-      * ``h`` —— 窗口高，**等于任务栏高**：窗口整个盖住任务栏那一段，
-        胶囊画在窗口里（上下留白由 CSS 居中），这样改变胶囊高度时不用
-        重设窗口几何
-      * ``bar_h`` —— 任务栏物理高度，供前端算胶囊高度
+      * ``w`` —— 贴片宽（逻辑像素乘倍率，150% 下文字大小才一致）
+      * ``h`` —— 窗口高 = 内容高（单行文字），不是整条任务栏
+      * ``bar_h`` —— 任务栏物理高度，供前端选字号档位、给提示窗定位
 
     拿不到任务栏时返回 None，调用方降级到 ``pill_rect``。
+
+    关于高度：扁平样式下窗口底色**就是**任务栏采样色，所以窗口不必等于
+    胶囊那样的紧凑形状 —— 但也不能占满整条任务栏：底色是**局部采样**的
+    值，铺满整条会和两端的渐变对不上，露出一条淡淡的横带。按内容高、垂直
+    居中，是让「不可见」这个目标最稳的做法。
     """
     bar = taskbar_rect()
     note = notify_area_rect()
@@ -909,16 +912,10 @@ def pill_rect_in_taskbar(pill_width, pill_height):
     scale = dpi_scale_at(anchor_x, int((bar_top + bar_bottom) / 2)) or 1.0
 
     w = max(1, int(round(max(1, int(pill_width)) * scale)))
-    # 窗口高度 = 胶囊高度，**不是**整条任务栏。
-    #
-    # 早先让窗口占满任务栏高度（h = bar_h），再靠 SetWindowRgn 把窗口裁成
-    # 胶囊 —— 结果胶囊外那一圈窗口底色是白的，压在浅灰任务栏上就是一圈
-    # 白边，看着像贴上去的补丁。现在窗口本身就是胶囊：把它裁成圆角后，
-    # 圆角以外完全不存在，没有「窗口底色」这个概念了。
     h = max(1, int(round(max(1, int(pill_height)) * scale)))
-    if h > bar_h - 4:
-        # 任务栏太矮（小图标档）时留 2 物理像素上下余量，别顶到边
-        h = max(1, bar_h - 4)
+    if h > bar_h - 2:
+        # 任务栏太矮（小图标档）时留 1 物理像素上下余量，别顶到边
+        h = max(1, bar_h - 2)
     y = bar_top + (bar_h - h) // 2
 
     # 贴片右边界贴住通知区域左边（^ 按钮就在通知区域最左侧）
@@ -1028,34 +1025,63 @@ def taskbar_background(near=None):
             gdi32.DeleteDC(mem_dc)
             user32.ReleaseDC(None, src_dc)
 
-        # 采样横向范围：给了 near 就只看它**左侧**那条空白，否则全条扫。
+        # 采样横向范围：给了 near 就用**贴片自己的横向区间**，但只取它
+        # 上方/下方那两条任务栏空白（贴片只占任务栏高度的一部分，上下必然
+        # 留白）。否则退到左侧邻域，再否则全条扫。
         #
-        # 为什么只取左侧：贴片紧靠托盘通知区，右邻域 80px 已经落进
-        # ``TrayNotifyWnd`` 的中性灰底，实测把众数从薄荷色 (228,244,244)
-        # 拉成中性灰 (220,220,220) —— 贴片左半边对、右半边偏，反而更花。
-        # 左边是任务栏真正的空白区，才是贴片「本该压在什么颜色上」的答案。
+        # 为什么不能用「左侧邻域」：Win11 任务栏是亚克力/云母材质，颜色跟着
+        # **壁纸**走，同一条任务栏上横向有渐变（实测贴片左边是薄荷
+        # (221,234,234)、右边已经是中性灰 (219,222,222)，中间差 12 级）。
+        # 采样左边得到"左邻域的颜色"，贴在中间就成了一条淡淡的竖带。
+        # 贴片正上方/正下方那两行是同一条竖线上、没被遮住的任务栏本身，
+        # 取它才是"贴片这个位置本该是什么颜色"的正确答案。
         x0, x1 = 4, width - 4
+        row_sets = [int(height * f) for f in (0.25, 0.5, 0.75)]
         skip_box = None
         if near:
             try:
                 nx, ny, nw, nh = (int(v) for v in near[:4])
-                lx0 = max(4, nx - 200 - left)
-                lx1 = nx - 6 - left
-                if lx1 - lx0 >= 40:
-                    x0, x1 = lx0, lx1
-                else:                     # 贴片太靠左，退回全条
-                    x0, x1 = 4, width - 4
-                # 贴片自己的矩形（换成任务栏局部坐标），采样时排除掉
-                skip_box = (nx - left, ny - top, nw, nh)
+                lx = nx - left                      # 任务栏局部坐标
+                lrx = lx + nw
+                ly = ny - top
+                lby = ly + nh
+                col0 = max(4, lx)
+                col1 = min(width - 4, lrx)
+                if col1 - col0 >= 8:
+                    x0, x1 = col0, col1
+                    # 纵向：贴片上边之上、下边之下各取几条线。
+                    # 每边留 1px 余量，避开窗口边缘的抗锯齿像素。
+                    above = list(range(2, max(3, ly - 1)))
+                    below = list(range(min(height - 3, lby + 1), height - 1))
+                    rows = above[-3:] + below[:3]
+                    if rows:
+                        row_sets = rows
+                    # 贴片自己的矩形（换成任务栏局部坐标），采样时排除掉
+                    skip_box = (lx, ly, nw, nh)
+                else:
+                    # 贴片太靠边（占满整条宽度）：退回左侧邻域
+                    lx0 = max(4, lx - 200)
+                    lx1 = lx - 6
+                    if lx1 - lx0 >= 40:
+                        x0, x1 = lx0, lx1
+                    skip_box = (lx, ly, nw, nh)
             except Exception:
                 x0, x1 = 4, width - 4
                 skip_box = None
 
-        # 三个高度横向扫描，把颜色量化到 4 的倍数后取众数
+        # 横向扫描若干行，把颜色量化到 4 的倍数后**分桶**找众数，
+        # 再返回桶内像素的**精确平均值**。
+        #
+        # ⚠ 为什么不能直接返回量化后的桶键：扁平样式的贴片底色必须和任务栏
+        # 逐像素一致，而量化会把 0~3 级的误差当精度丢掉 —— 实测任务栏真实
+        # 是 (222,234,234)，量化到 4 的倍数就成了 (220,232,232)，贴上去
+        # 立刻显出一条淡淡的方印子。分桶只用来"找出哪种颜色占多数"，
+        # 具体数值必须回到原始像素去算。
         hist = {}
         step = 1 if (x1 - x0) <= 400 else 3
-        for frac in (0.25, 0.5, 0.75):
-            row = int(height * frac)
+        for row in row_sets:
+            if row < 0 or row >= height:
+                continue
             base = row * width * 4
             for col in range(x0, x1, step):
                 if skip_box:
@@ -1068,11 +1094,22 @@ def taskbar_background(near=None):
                     continue
                 if r < 24 and g < 24 and b < 24:
                     continue          # 图标笔画，不是底色
-                key = (r // 4 * 4, g // 4 * 4, b // 4 * 4)
-                hist[key] = hist.get(key, 0) + 1
+                key = (r // 4, g // 4, b // 4)
+                slot = hist.get(key)
+                if slot is None:
+                    hist[key] = [1, r, g, b]
+                else:
+                    slot[0] += 1
+                    slot[1] += r
+                    slot[2] += g
+                    slot[3] += b
         if not hist:
             return None
-        return max(hist.items(), key=lambda kv: kv[1])[0]
+        best = max(hist.values(), key=lambda v: v[0])
+        n = best[0]
+        return (int(round(best[1] / n)),
+                int(round(best[2] / n)),
+                int(round(best[3] / n)))
     except Exception:
         return None
 
@@ -1114,6 +1151,266 @@ def taskbar_metrics(near=None):
     }
 
 
+def taskbar_background_profile(near, stops=7):
+    """沿贴片自己的横向区间采样**若干点**的任务栏底色，返回 ``[[t, r, g, b], ...]``。
+
+    为什么必须是"若干点"而不是一个色：Win11 任务栏是亚克力/云母材质，颜色
+    跟着壁纸走，同一条任务栏上**横向有明显渐变**。实测通知区附近：
+
+        x=1700 → (209, 221, 221)
+        x=1850 → (216, 229, 228)
+        x=1900 → (224, 236, 233)
+        x=2000 → (230, 234, 234)
+
+    90 像素宽的贴片横跨这段就是 8~20 级的差 —— 填一个纯色，无论取哪个
+    采样点，总有一条边对不上，视觉上就是「任务栏上一块淡淡的方印子」。
+    所以前端拿这组点画一条 ``linear-gradient(to right, ...)``。
+
+    ``t`` 是 0..1 的归一化位置（贴片左边界 = 0、右边界 = 1）。纵向取贴片
+    上方/下方那两行空白（贴片只占任务栏高度的一部分，上下必然留白），
+    这样采到的是"贴片这个位置本该是什么颜色"。
+
+    采样失败返回 None，调用方退回单色 ``taskbar_background``。
+    """
+    if not IS_WINDOWS or not near:
+        return None
+    try:
+        import ctypes
+        import ctypes.wintypes as wt
+
+        user32 = ctypes.windll.user32
+        gdi32 = ctypes.windll.gdi32
+        user32.GetWindowRect.argtypes = [wt.HWND, ctypes.POINTER(wt.RECT)]
+        user32.GetDC.argtypes = [wt.HWND]
+        user32.GetDC.restype = wt.HDC
+        user32.ReleaseDC.argtypes = [wt.HWND, wt.HDC]
+        gdi32.CreateCompatibleDC.restype = wt.HDC
+        gdi32.CreateDIBSection.restype = wt.HANDLE
+        gdi32.BitBlt.restype = wt.BOOL
+
+        tray = user32.FindWindowW("Shell_TrayWnd", None)
+        if not tray:
+            return None
+        rect = wt.RECT()
+        if not user32.GetWindowRect(tray, ctypes.byref(rect)):
+            return None
+        left, top = int(rect.left), int(rect.top)
+        width, height = int(rect.right - rect.left), int(rect.bottom - rect.top)
+        if width <= 8 or height <= 8:
+            return None
+
+        nx, ny, nw, nh = (int(v) for v in near[:4])
+        lx = max(1, nx - left)
+        rx = min(width - 1, lx + nw)
+        if rx - lx < 8:
+            return None
+        ly = ny - top
+        lby = ly + nh
+
+        class _BIH(ctypes.Structure):
+            _fields_ = [("biSize", wt.DWORD), ("biWidth", wt.LONG),
+                        ("biHeight", wt.LONG), ("biPlanes", wt.WORD),
+                        ("biBitCount", wt.WORD), ("biCompression", wt.DWORD),
+                        ("biSizeImage", wt.DWORD), ("biXPelsPerMeter", wt.LONG),
+                        ("biYPelsPerMeter", wt.LONG), ("biClrUsed", wt.DWORD),
+                        ("biClrImportant", wt.DWORD)]
+
+        bmi = _BIH()
+        bmi.biSize = ctypes.sizeof(_BIH)
+        bmi.biWidth = width
+        bmi.biHeight = -height
+        bmi.biPlanes = 1
+        bmi.biBitCount = 32
+        bmi.biCompression = 0
+
+        bits = ctypes.c_void_p()
+        src_dc = user32.GetDC(None)
+        mem_dc = gdi32.CreateCompatibleDC(src_dc)
+        try:
+            hbmp = gdi32.CreateDIBSection(src_dc, ctypes.byref(bmi), 0,
+                                          ctypes.byref(bits), None, 0)
+            if not hbmp or not bits:
+                return None
+            try:
+                gdi32.SelectObject(mem_dc, hbmp)
+                if not gdi32.BitBlt(mem_dc, 0, 0, width, height, src_dc,
+                                    left, top, 0x00CC0020):
+                    return None
+                gdi32.GdiFlush()
+                raw = ctypes.string_at(bits, width * height * 4)
+            finally:
+                gdi32.DeleteObject(hbmp)
+        finally:
+            gdi32.DeleteDC(mem_dc)
+            user32.ReleaseDC(None, src_dc)
+
+        # 纵向采样行：贴片上方之上、下方之下各几条，都避开窗口边缘 2px
+        rows = []
+        for y in range(max(1, ly - 3), max(1, ly - 1)):
+            rows.append(y)
+        for y in range(min(height - 2, lby + 1), min(height - 1, lby + 3)):
+            rows.append(y)
+        if not rows:
+            return None
+
+        out = []
+        span = max(1, rx - lx)
+        for i in range(stops):
+            t = i / float(stops - 1) if stops > 1 else 0.0
+            col = lx + int(round(t * (span - 1)))
+            col = max(1, min(width - 2, col))
+            acc = [0, 0, 0, 0]
+            for y in rows:
+                off = y * width * 4 + col * 4
+                b, g, r, a = raw[off], raw[off + 1], raw[off + 2], raw[off + 3]
+                if a < 250:
+                    continue
+                acc[0] += r
+                acc[1] += g
+                acc[2] += b
+                acc[3] += 1
+            if not acc[3]:
+                continue
+            n = acc[3]
+            out.append([round(t, 3),
+                        int(round(acc[0] / n)),
+                        int(round(acc[1] / n)),
+                        int(round(acc[2] / n))])
+        return out if len(out) >= 2 else None
+    except Exception:
+        return None
+
+
+def window_interior_profile(hwnd, stops=7, rows=(0.07, 0.93)):
+    """沿窗口宽度采样**若干点**的屏幕像素颜色，返回 ``[[t, r, g, b], ...]``。
+
+    只用于色彩校准：要知道「我们写进去的渐变，屏幕上到底变成了什么」。
+
+    为什么采 ``rows=(0.07, 0.93)``：贴片内容是单行文字，垂直居中占中间约
+    16px；上下那 7% 的位置整条都是纯背景，横跨全宽都能安全采样，不需要
+    额外留白。**不能**在垂直中点采样 —— 那里是图标和「90%」的笔画。
+
+    返回 None 表示读不到（窗口不可见/被遮挡/非 Windows）。
+    """
+    if not IS_WINDOWS or not hwnd:
+        return None
+    try:
+        import ctypes
+        import ctypes.wintypes as wt
+
+        user32 = ctypes.windll.user32
+        user32.GetWindowRect.argtypes = [wt.HWND, ctypes.POINTER(wt.RECT)]
+        user32.IsWindowVisible.argtypes = [wt.HWND]
+        user32.IsIconic.argtypes = [wt.HWND]
+
+        if not user32.IsWindowVisible(ctypes.c_void_p(hwnd)):
+            return None
+        if user32.IsIconic(ctypes.c_void_p(hwnd)):
+            return None
+        r = wt.RECT()
+        if not user32.GetWindowRect(ctypes.c_void_p(hwnd), ctypes.byref(r)):
+            return None
+        left, top = int(r.left), int(r.top)
+        w, h = int(r.right - r.left), int(r.bottom - r.top)
+        if w <= 16 or h <= 8:
+            return None
+
+        ys = [top + max(1, min(h - 2, int(round(f * (h - 1))))) for f in rows]
+
+        from PIL import ImageGrab  # 只在需要校准时才 import
+        out = []
+        for i in range(stops):
+            t = i / float(stops - 1) if stops > 1 else 0.0
+            cx = left + int(round(t * (w - 1)))
+            cx = max(left + 1, min(left + w - 2, cx))
+            acc = [0, 0, 0, 0]
+            for cy in ys:
+                img = ImageGrab.grab(bbox=(cx - 1, cy - 1, cx + 2, cy + 2))
+                for p in img.convert("RGB").getdata():
+                    acc[0] += p[0]
+                    acc[1] += p[1]
+                    acc[2] += p[2]
+                    acc[3] += 1
+            if not acc[3]:
+                continue
+            n = acc[3]
+            out.append([round(t, 3),
+                        int(round(acc[0] / n)),
+                        int(round(acc[1] / n)),
+                        int(round(acc[2] / n))])
+        return out if len(out) >= 2 else None
+    except Exception:
+        return None
+
+
+def window_interior_color(hwnd, x_frac=0.5, y_frac=0.5):
+    """读**窗口自己渲染出来的**屏幕像素颜色，返回 ``(r, g, b)`` 中位数。
+
+    ``x_frac`` / ``y_frac`` 是采样点在窗口内的归一化位置。要和渐变采样点
+    对齐时必须传同一个位置 —— 拿"窗口左边缘的颜色"去比"渐变中段的颜色"
+    算出来的差值毫无意义（早期就是这么错的，越补越偏）。
+
+    用途只有一个：**色彩校准**。
+
+    ============================================================
+    为什么需要它（实测数据，别删）
+    ============================================================
+    同一块屏幕上：
+
+      * 任务栏自己的像素是 ``(221, 233, 233)``；
+      * 窗口 CSS 写 ``#dce8e8`` = ``(220, 232, 232)``；
+      * 屏幕上量到的窗口像素却是 ``(216, 234, 234)`` —— R 少 4、G 多 2。
+
+    这不是采样错，也不是 WebView2 的锅：纯 GDI 的 tkinter 窗口填同一个
+    ``#dce8e8``，屏幕像素同样是 ``(216,234,234)``。根因是显示器色彩管理在
+    窗口合成这条路上做了一次变换，而任务栏走另一条路径。
+
+    对扁平贴片这是致命的：底色只要差几级，就是一块淡淡的方印子。
+
+    ``winui`` 只负责"读回来"，换算成补偿量在 ``main._calibrated_*`` 里做。
+    窗口没显示 / 被完全遮挡时返回 None，调用方沿用上次的补偿量。
+    """
+    if not IS_WINDOWS or not hwnd:
+        return None
+    try:
+        import ctypes
+        import ctypes.wintypes as wt
+
+        user32 = ctypes.windll.user32
+        user32.GetWindowRect.argtypes = [wt.HWND, ctypes.POINTER(wt.RECT)]
+        user32.IsWindowVisible.argtypes = [wt.HWND]
+        user32.IsIconic.argtypes = [wt.HWND]
+
+        if not user32.IsWindowVisible(ctypes.c_void_p(hwnd)):
+            return None
+        if user32.IsIconic(ctypes.c_void_p(hwnd)):
+            return None
+        r = wt.RECT()
+        if not user32.GetWindowRect(ctypes.c_void_p(hwnd), ctypes.byref(r)):
+            return None
+        left, top = int(r.left), int(r.top)
+        w, h = int(r.right - r.left), int(r.bottom - r.top)
+        if w <= 8 or h <= 8:
+            return None
+
+        cx = left + int(round(max(0.08, min(0.92, x_frac)) * (w - 1)))
+        cy = top + int(round(max(0.15, min(0.85, y_frac)) * (h - 1)))
+
+        from PIL import ImageGrab  # 只在需要校准时才 import
+        img = ImageGrab.grab(bbox=(cx - 1, cy - 1, cx + 2, cy + 2))
+        px = list(img.convert("RGB").getdata())
+        if not px:
+            return None
+        # 逐通道取中位数：3×3 里只要多数像素是纯背景，结果就是背景色
+        out = []
+        for i in range(3):
+            vals = sorted(p[i] for p in px)
+            out.append(vals[len(vals) // 2])
+        return tuple(out)
+    except Exception:
+        return None
+
+
 def _taskbar_is_dark():
     """任务栏是否为深色。读不到就当浅色（默认外观）。"""
     try:
@@ -1131,7 +1428,7 @@ def _taskbar_is_dark():
 
 
 def clip_round_rect(hwnd, radius):
-    """把窗口裁成圆角矩形（胶囊形状）。``radius`` 传**逻辑像素**。
+    """把窗口裁成圆角矩形。``radius`` 传**逻辑像素**，**0 = 不裁（直角）**。
 
     为什么必须剪裁，而不是靠 CSS 的圆角 + 透明背景：
     pywebview 的 ``transparent=True`` 在 WinForms + WebView2 上并没有真正
@@ -1140,21 +1437,27 @@ def clip_round_rect(hwnd, radius):
     用 ``SetWindowRgn`` 直接裁窗口形状最稳：像素级生效，不依赖合成器，
     而且连 WebView2 的子窗口一起被裁掉。
 
-    裁剪后窗口矩形之外的部分完全不可见，也**不响应鼠标**（点击穿透），
-    这正好是「贴在任务栏里的一枚胶囊」需要的行为。
+    ``radius <= 0`` 时**清掉区域**（``SetWindowRgn(hwnd, None)``），让窗口
+    保持原本的矩形：扁平样式的贴片窗口底色就是任务栏采样色，任何圆角都会
+    在四角露出一点任务栏本身，颜色对不齐时反而显出一圈缺口。
     """
     if not IS_WINDOWS or not hwnd:
         return False
     try:
         import ctypes
         import ctypes.wintypes as wt
+
+        scale = _dpi_scale() or 1.0
+        px = int(round(max(0, int(radius)) * scale))
+        if px <= 0:
+            return bool(ctypes.windll.user32.SetWindowRgn(
+                ctypes.c_void_p(hwnd), None, True))
+
         r = wt.RECT()
         ctypes.windll.user32.GetWindowRect(ctypes.c_void_p(hwnd), ctypes.byref(r))
         w = max(1, r.right - r.left)
         h = max(1, r.bottom - r.top)
-        # 半径按逻辑像素给，这里换物理；上限不超过半高（否则不是胶囊是椭圆）
-        scale = _dpi_scale() or 1.0
-        px = int(round(max(0, int(radius)) * scale))
+        # 上限不超过半高（否则不是圆角矩形是椭圆）
         px = min(px, h // 2)
         # CreateRoundRectRgn 的椭圆宽高是**直径**，所以传 2*px
         rgn = ctypes.windll.gdi32.CreateRoundRectRgn(

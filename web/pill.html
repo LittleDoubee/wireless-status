@@ -7,8 +7,10 @@
 <link rel="stylesheet" href="/web/style.css">
 <link rel="stylesheet" href="/web/pill.css">
 </head>
-<!-- 贴片页：无边框、圆角、置顶、不占任务栏按钮、不可拖动。
-     内容由 pill.js 填，最多 4 个胶囊 + 「+N」。 -->
+<!-- 贴片页：无边框、置顶、不占任务栏按钮、不可拖动。
+     内容是**一行**「图标 + 数值」，多设备并列（需求 2/3）。
+     悬停信息由 tipwindow.py 的独立 Win32 气泡负责 —— 这里不做 tooltip，
+     因为 WebView2 画不出被 SetWindowRgn 裁掉的窗口边界之外。 -->
 <body class="pill-page">
   <div class="pill-wrap" id="pill-wrap"></div>
   <script src="/web/pill.js"></script>

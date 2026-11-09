@@ -47,6 +47,7 @@ import devices
 import history
 import mouse_source
 import server
+import tipwindow
 import usage
 import winui
 
@@ -56,6 +57,9 @@ APP_VERSION = apppath.APP_VERSION   # 收口到 apppath，托盘提示和 /api/p
 
 MUTEX_NAME = "WirelessStatus.SingleInstance.v3"
 ERROR_ALREADY_EXISTS = 183
+
+#: ``SetEvent`` 需要的访问权限（winnt.h 的 EVENT_MODIFY_STATE）。
+EVENT_MODIFY_STATE = 0x0002
 
 #: 命令泵的取队列超时（秒）。空闲时按这个节奏做维护，也按它轮询光标
 #: 是否已经离开主窗（自动收起用）。0.2s 是为了让「离开 2 秒收起」的判定
@@ -87,30 +91,35 @@ ANIM_FRAME_SEC = 0.016
 
 #: 贴片尺寸（逻辑像素）。
 #:
-#: 宽 200 是**窗口**宽度 —— 胶囊本身只有内容那么宽，靠右贴住托盘图标，
-#: 左边那段空白靠窗口区域裁剪彻底剪掉（见 ``winui.clip_round_rect``），
-#: 所以视觉上只看得到一枚紧凑的胶囊，不会是一条长条。
+#: 宽 200 是**窗口**宽度 —— 内容只有那么宽，靠右贴住托盘图标，左边那段空白
+#: 靠窗口区域裁剪彻底剪掉（见 ``winui.clip_round_rect``），所以视觉上只看得到
+#: 一行文字，不会是一条长条。
 #:
-#: 高度 30 = 胶囊高度（窗口高度也是它）：任务栏 48 逻辑像素时，胶囊上下
-#: 各留 9 像素，和系统原生图标分组框的留白接近。**窗口不再占满任务栏**
-#: ——占满的话胶囊外会露出窗口底色，在浅灰任务栏上就是一圈白边。
+#: 高度 26 是**单行文字**的高度：图标 16 + 上下各 5 的余量。任务栏 32 逻辑
+#: 像素时上下各留 3 像素，文字正好和托盘图标同一水平线居中。
+#:
+#: ⚠ 已**没有**「胶囊」这个概念了（用户需求 2）：贴片不再是一枚带底色、
+#: 带描边、带圆角的胶囊，而是像 LiteMonitor 那样**直接画在任务栏上的文字**。
+#: 窗口底色 = 任务栏采样色（见 ``_pill_background_color``），圆角半径 0，
+#: 于是窗口边界看不出来，只剩「图标 + 数值」浮在任务栏上。
 PILL_WIDTH = 200
-PILL_HEIGHT = 30
+PILL_HEIGHT = 26
 
-#: 贴片圆角半径（逻辑像素）。
+#: 贴片圆角半径（逻辑像素）。**0 = 直角**。
 #:
-#: 取 8 而不是「高度的一半」：Win11 原生托盘图标分组框是**圆角矩形**，
-#: 实测参考图上 37 逻辑像素高的框，圆角约 8 像素。做成半高的胶囊反而
-#: 更像第三方小挂件，不像系统自带。
-#: ``winui.clip_round_rect`` 内部会乘 dpi_scale 换成物理像素。
-PILL_RADIUS = 8
+#: 扁平样式必须直角：带圆角时窗口四角会被裁掉，而窗口底色就是任务栏色，
+#: 裁掉之后四角露出的是**任务栏自己**，颜色对不上时就成了一圈浅色缺口。
+#: 直角 + 同色 = 完全看不出边界。
+PILL_RADIUS = 0
 
-#: 贴片窗口宽度范围（逻辑像素）。前端量出胶囊实际宽度后报告，
-#: 窗口按这个宽度收窄，避免大片透明区挡住任务栏点击。
-#: 下限 60 是「一个图标 + 一个百分比」的极限；实测 90% 时胶囊约 72 宽，
-#: 留点余量免得文字被窗口边缘切掉。
+#: 贴片窗口宽度范围（逻辑像素）。前端量出内容实际宽度后报告，窗口按这个
+#: 宽度收窄/加宽，避免多余空白挡住任务栏点击。
+#:
+#: 下限 60 是「一个图标 + 一个百分比」的极限（实测 90% 时约 46 宽，留余量）；
+#: 上限 420 是**一行并列 4 台设备**的宽度（图标 + 两位数字 + 间隔 ≈ 60/台，
+#: 加 +N）。再宽就该考虑收进 +N 了，否则会顶到任务栏左边的应用图标区。
 PILL_MIN_WIDTH = 60
-PILL_MAX_WIDTH = 320
+PILL_MAX_WIDTH = 420
 
 #: 窗口贴任务栏上沿时留的边距（逻辑像素）。
 TASKBAR_MARGIN = 8
@@ -118,6 +127,14 @@ TASKBAR_MARGIN = 8
 #: 自定义消息：第二次启动时用它唤起已有实例的窗口。
 WM_SHOW_EXISTING = ctypes.windll.user32.RegisterWindowMessageW(
     "WirelessStatusShowExisting") if sys.platform == "win32" else 0
+
+#: 「请把主窗显示出来」的跨进程信号。
+#:
+#: 为什么不用 ``PostMessage(WM_SHOW_EXISTING)``：主窗的 WndProc 是 pywebview
+#: （WinForms）的，我们没法从外部挂自己的消息处理函数 —— 发过去只会落进
+#: WinForms 的默认分支，什么都不会发生。命名事件是纯 Win32、跨进程、
+#: 不需要任何窗口句柄，命令泵每 0.2s 顺手查一次即可。
+WAKE_EVENT_NAME = "WirelessStatus.ShowRequest.v3"
 
 
 # ---------------------------------------------------------------- 环境准备
@@ -368,6 +385,14 @@ class Api(object):
         """前端量出贴片胶囊的实际宽度，窗口跟着收窄（剪掉左边空白）。"""
         return self._app.set_pill_width(width)
 
+    def set_pill_hover(self, key="", hovering=False):
+        """贴片悬停：显示 / 收起设备信息气泡（需求 4）。
+
+        气泡是**独立的 Win32 顶层窗**（``tipwindow.py``）—— WebView2 画不出
+        贴片窗口之外的东西，用 HTML tooltip 会被 SetWindowRgn 裁掉。
+        """
+        return self._app.set_pill_hover(key, hovering)
+
     def open_window(self):
         return self._app.open_window()
 
@@ -559,8 +584,16 @@ class WirelessStatusApp(object):
         #: 贴片所在任务栏的物理高度（给前端选字号档位）
         self._pill_bar_height = 0
         #: 贴片自己的物理矩形 (x, y, w, h)。前端采样任务栏底色时按它取
-        #: 邻域 —— 任务栏底色横向有渐变，全条众数会偏暗十几级。
+        #: 邻域 —— 任务栏底色横向有渐变，全条众数会偏暗十几级；提示气泡
+        #: 也按它定位（摆在它正上方）。
         self._pill_geom = None
+        #: 悬停提示气泡（独立 Win32 顶层窗，见 tipwindow.py）。懒启动 ——
+        #: 贴片开关关着时完全不会创建线程。
+        self._tip = None
+        #: 当前指针悬停的设备 key（前端上报），None = 没悬停
+        self._pill_hover_key = None
+        #: 「第二个实例请我显示窗口」的命名事件句柄（见 _poll_post_message）
+        self._wake_event = None
 
     # ---------------------------------------------------------------- 启动
 
@@ -634,6 +667,11 @@ class WirelessStatusApp(object):
         if self.store.config.get("battery_pill_enabled"):
             self._create_pill_window(url)
 
+        # 唤醒事件：第二个实例带 --show 时会 SetEvent，命令泵负责转成
+        # show_window()（见 _poll_post_message）。放在 _start_pump 之前，
+        # 免得第一拍轮询时句柄还是 None。
+        self._wake_event = self._open_wake_event()
+
         self._start_pump()
         try:
             webview.start(self._after_start, gui="edgechromium", debug=False)
@@ -692,20 +730,18 @@ class WirelessStatusApp(object):
                 on_top=True,
                 # 贴片**不要** transparent=True：那会让 pywebview 把窗口做成
                 # WS_EX_LAYERED + AllowsTransparency，实测在 WebView2 上只会
-                # 留下一整块不透明黑底，把任务栏盖住。改成普通不透明窗口
-                # + 纯 Win32 的 SetWindowRgn 裁成圆角矩形（见
-                # ``_apply_pill_host``），形状确定、不依赖合成器。
+                # 留下一整块不透明黑底，把任务栏盖住。改成普通不透明窗口，
+                # 底色直接取任务栏采样色（见 ``_pill_background_color``）——
+                # 扁平样式下「看不见窗口边界」就是这么来的。
                 transparent=False,
-                # 窗口底色 = 从任务栏采样出来的颜色。这是**首帧**的底色：
-                # 页面加载后 pill.js 会按同一份采样值再写一次 CSS 变量，
-                # 但页面起来之前 WebView2 先画的是这一块，给个白底的话
-                # 打开瞬间会闪一下白方块。采样失败退回中性浅灰。
+                # 窗口底色 = 任务栏采样色（**不再提亮**）。页面起来之前 WebView2
+                # 先画的是这一块，采样值一致才不会闪一下。
                 background_color=self._pill_background_color(),
                 resizable=False,
                 # pywebview 默认 min_size=(200, 100)，PILL_HEIGHT 高的贴片会被
                 # 强行撑到 100 逻辑像素（150% 缩放下就是 150 物理像素），
                 # 结果贴片是个大方块。必须显式给小尺寸。
-                # 左边界给 PILL_MIN_WIDTH：胶囊内容收窄时窗口要能跟着变窄。
+                # 左边界给 PILL_MIN_WIDTH：多设备变宽/变窄时窗口要能跟着变。
                 min_size=(PILL_MIN_WIDTH, PILL_HEIGHT),
                 focus=False,
                 shadow=False,
@@ -723,15 +759,36 @@ class WirelessStatusApp(object):
                     winui.hide_from_taskbar(ph_hwnd,
                                             self._main_hwnd() or None)
                     # 需求第 2 条：挂成任务栏子窗口，跟任务栏同图层。
-                    # 圆角裁剪由 _apply_pill_host() 在设完几何之后统一做
+                    # 形状裁剪由 _apply_pill_host() 在设完几何之后统一做
                     # （必须先几何后裁剪，见那里的注释）。
                     # 失败会自动退回置顶浮窗并把原因写进 _pill_error。
                     self._apply_pill_host()
+                self._ensure_tip_window()
             except Exception:
                 traceback.print_exc()
         except Exception:
             traceback.print_exc()
             self._pill_error = "贴片窗口创建失败"
+
+    def _ensure_tip_window(self):
+        """按需创建悬停提示窗（独立线程，见 tipwindow.py）。
+
+        懒启动的理由：贴片开关关着时用户根本不会再悬停到它上面，为一个
+        永远不显示的气泡常驻一条消息泵线程不值得。失败只记一笔，不抛 ——
+        提示窗坏了不该让贴片或主程序跟着挂。
+        """
+        if self._tip is not None:
+            return self._tip
+        try:
+            tip = tipwindow.TipWindow()
+            if tip.start():
+                self._tip = tip
+            else:
+                self._pill_error = "悬停提示窗创建失败：%s" % (tip.error or "未知原因")
+        except Exception:
+            traceback.print_exc()
+            self._pill_error = "悬停提示窗创建失败"
+        return self._tip
 
     def _after_start(self):
         """``webview.start()`` 的回调 —— **这里什么窗口操作都不能做**。
@@ -902,6 +959,10 @@ class WirelessStatusApp(object):
                     # 空闲时顺手做点维护：历史抽稀、用量落盘
                     self._housekeeping()
                     try:
+                        self._poll_post_message()
+                    except Exception:
+                        pass
+                    try:
                         self._poll_panel_state()
                     except Exception:
                         pass
@@ -925,6 +986,43 @@ class WirelessStatusApp(object):
                     pass
         t = threading.Thread(target=loop, name="cmd-pump", daemon=True)
         t.start()
+
+    def _poll_post_message(self):
+        """检查「第二个实例请我显示窗口」的命名事件（``--show`` 用）。
+
+        为什么用事件而不是窗口消息：主窗的 WndProc 是 pywebview（WinForms）
+        的，外部挂不上自己的消息处理函数，发 ``WM_*`` 进去只会被默认分支
+        吃掉。命名事件是纯 Win32、跨进程、不需要窗口句柄；这里每 0.2s
+        查一次，有信号就走 ``show_window()``（那条路径才是线程安全的）。
+
+        事件是**手动重置**的：Handle 之后要自己 ``ResetEvent``，否则下一次
+        启动再 Set 时状态一直保持"已触发"，会变成每次轮询都弹窗。
+        """
+        if self._wake_event is None:
+            return
+        try:
+            kernel32 = ctypes.windll.kernel32
+            if not kernel32.WaitForSingleObject(self._wake_event, 0) == 0:
+                return
+            kernel32.ResetEvent(self._wake_event)
+        except Exception:
+            return
+        try:
+            self.show_window()
+        except Exception:
+            traceback.print_exc()
+
+    def _open_wake_event(self):
+        """创建（或打开）唤醒事件。失败返回 None —— 唤窗功能降级，不影响运行。"""
+        try:
+            kernel32 = ctypes.windll.kernel32
+            kernel32.CreateEventW.restype = ctypes.c_void_p
+            kernel32.OpenEventW.restype = ctypes.c_void_p
+            # CreateEventW(attr, bManualReset=True, bInitialState=False, name)
+            handle = kernel32.CreateEventW(None, True, False, WAKE_EVENT_NAME)
+            return handle or None
+        except Exception:
+            return None
 
     def _housekeeping(self):
         """低频维护：每 5 分钟清一次过期历史。放在命令泵里跑，不另起线程。"""
@@ -1213,12 +1311,14 @@ class WirelessStatusApp(object):
         return w, PILL_HEIGHT, pos[0], pos[1]
 
     def _pill_background_color(self):
-        """贴片窗的**首帧**底色：从任务栏采样色推出来，采样失败给中性浅灰。
+        """贴片窗的**首帧**底色：**原样**用任务栏采样色。
 
-        为什么不写死 #f7f8fa：Win11 任务栏是亚克力材质，颜色跟着壁纸走。
-        写死的浅色在深色壁纸/深色主题下会亮出一大截，看起来就是「贴上去的
-        白补丁」。页面加载后 ``pill.js`` 会按同一份采样值改写 CSS 变量，
-        这里只是让**页面起来之前**那几十毫秒也别闪个白方块。
+        扁平样式（需求 2）里贴片不是一枚有底色的胶囊，而是「直接写在任务栏
+        上的文字」。所以窗口底色必须和任务栏**完全一致** —— 早期实现会提亮
+        2~6 级（那是为了做胶囊的层次感），现在提亮一点点都会让贴片变成任务栏
+        上一块淡淡的方印子。
+
+        采样失败退回中性浅灰/深灰：宁可有点色差，也不能闪一块纯黑或纯白。
         """
         gray = "#e9eaeb"
         try:
@@ -1230,10 +1330,7 @@ class WirelessStatusApp(object):
         if not bg:
             return "#2b2b2b" if dark else gray
         try:
-            lum = (bg[0] * 299 + bg[1] * 587 + bg[2] * 114) / 1000.0
-            delta = 12 if (dark or lum <= 128) else 6
-            r, g, b = [max(0, min(255, int(c) + delta)) for c in bg]
-            return "#%02x%02x%02x" % (r, g, b)
+            return "#%02x%02x%02x" % tuple(int(c) for c in bg[:3])
         except Exception:
             return gray
 
@@ -1293,12 +1390,13 @@ class WirelessStatusApp(object):
         return False
 
     def set_pill_width(self, width):
-        """前端报告贴片内容的实际宽度，窗口跟着收窄。
+        """前端报告贴片内容的实际宽度，窗口跟着收窄或加宽。
 
-        贴片窗一开始按 ``PILL_WIDTH`` 建，但胶囊本身只有内容那么宽。
-        不跟着收窄的话，窗口左边会有约 130 逻辑像素的空白 —— 虽然被
-        ``clip_round_rect`` 裁掉了看不见，**但会挡住任务栏上那块区域的
-        点击**（用户点不到下面的托盘图标）。所以必须按内容宽度真实收窄。
+        贴片窗一开始按 ``PILL_WIDTH`` 建，但内容（图标 + 数值）只有那么宽。
+        不跟着收窄的话，窗口两边会有几十到上百逻辑像素的空白 —— 虽然底色
+        和任务栏一样、看不出边界，**但会挡住任务栏上那块区域的点击**
+        （用户点不到下面的托盘图标、也点不到 ^ 箭头）。所以必须按内容宽度
+        真实收窄。
         """
         try:
             w = int(width)
@@ -1322,6 +1420,78 @@ class WirelessStatusApp(object):
             except Exception:
                 traceback.print_exc()
         return {"ok": True, "width": w, "changed": True}
+
+    def set_pill_hover(self, key=None, hovering=False):
+        """贴片前端报告「指针在不在某个设备上」，后端负责弹/收提示气泡。
+
+        为什么要绕后端一圈：提示窗是独立的 Win32 顶层窗口（见
+        ``tipwindow.py`` 的说明），WebView2 画不到贴片窗口之外的地方，
+        所以前端只能把「现在悬停的是谁」告诉 Python，由 Python 去摆那个窗。
+
+        参数 ``key`` 是设备的 ``key``（``B021_4080CFB3`` 这种）；``hovering``
+        False 表示指针离开了（此时 key 可省略）。
+
+        返回 ``{"ok": True, "shown": bool}`` —— 前端不依赖返回值，但它能在
+        调试时说明「后端到底有没有弹」。
+        """
+        if not hovering:
+            self._pill_hover_key = None
+            if self._tip is not None:
+                try:
+                    self._tip.hide()
+                except Exception:
+                    pass
+            return {"ok": True, "shown": False}
+
+        key = (key or "").strip()
+        if not key:
+            return {"ok": False, "error": "缺少设备 key"}
+        self._pill_hover_key = key
+        shown = self._show_pill_tip(key)
+        return {"ok": True, "shown": bool(shown)}
+
+    def _show_pill_tip(self, key):
+        """按 key 找到设备并弹出提示气泡。返回是否显示成功。"""
+        if self._tip is None:
+            return False
+        device = None
+        for d in (self._last_devices or []):
+            if d.get("key") == key:
+                device = d
+                break
+        if device is None:
+            # 隐藏状态下前端不轮询，_last_devices 可能是空的 —— 现取一次
+            try:
+                for d in self._decorate(
+                        self.provider.snapshot().get("devices") or []):
+                    if d.get("key") == key:
+                        device = d
+                        break
+            except Exception:
+                pass
+        if device is None:
+            return False
+
+        title, sub = tipwindow.format_lines(device)
+        anchor = getattr(self, "_pill_geom", None)
+        if not anchor:
+            try:
+                g = winui.pill_rect_in_taskbar(
+                    int(getattr(self, "_pill_width", PILL_WIDTH)), PILL_HEIGHT)
+                anchor = (g[0], g[1], g[2], g[3]) if g else None
+            except Exception:
+                anchor = None
+        dark = False
+        try:
+            dark = bool((winui.taskbar_metrics() or {}).get("dark"))
+        except Exception:
+            pass
+        try:
+            self._tip.show(title, sub, anchor=anchor, dark=dark)
+            return True
+        except Exception:
+            traceback.print_exc()
+            return False
 
     def _reposition(self):
         """按当前工作区把两个窗口挪到正确位置。
@@ -1628,6 +1798,12 @@ class WirelessStatusApp(object):
     def shutdown(self):
         self._pump_stop.set()
         self.persist_geometry()
+        if self._tip is not None:
+            try:
+                self._tip.stop()
+            except Exception:
+                pass
+            self._tip = None
         if self.tray is not None:
             self.tray.stop()
         try:
@@ -1783,7 +1959,14 @@ class WirelessStatusApp(object):
         return self.usage_data()
 
     def _update_tray_tip(self, snap):
-        """托盘悬停提示跟着数据走：设备数 + 第一台的电量。"""
+        """托盘悬停提示跟着数据走：设备名 + 型号 + 电量（需求 4 的托盘版）。
+
+        拼装逻辑复用 ``tipwindow.format_lines`` —— 贴片气泡和托盘提示都是
+        「设备名一行 + 关键信息一行」的同一套口径，两处各拼一套迟早会漂移
+        （比如一边写「今日用电」一边写「今日用量」）。
+
+        托盘提示是单行的（``szTip`` 128 字符上限），所以两行拼成一行。
+        """
         if self.tray is None:
             return
         devs = snap.get("devices") or []
@@ -1793,14 +1976,10 @@ class WirelessStatusApp(object):
         elif not online:
             tip = "%s — %d 台设备均已离线" % (APP_TITLE, len(devs))
         else:
-            d = online[0]
-            parts = [d.get("display_name") or APP_TITLE]
-            bat = d.get("battery") or {}
-            if bat.get("supported") and bat.get("percent") is not None:
-                parts.append("%d%%" % bat["percent"])
+            title, sub = tipwindow.format_lines(online[0])
+            tip = "%s — %s" % (title, sub) if sub else title
             if len(devs) > 1:
-                parts.append("共 %d 台" % len(devs))
-            tip = " · ".join(parts)
+                tip += "（共 %d 台）" % len(devs)
         if tip != getattr(self, "_last_tip", None):
             self._last_tip = tip
             try:
@@ -1896,12 +2075,21 @@ class WirelessStatusApp(object):
         窗口时会走缓存，下次 ``_apply_pill_host()`` 拿着一个死句柄去
         ``SetParent`` —— 不报错但也不生效，表现是「关了再开，贴片没了」。
         所以这里三个地方一起清。
+
+        提示气泡也一起收掉：贴片没了就没人能悬停到它上面，留着会是一个
+        永远盖在任务栏上方的空窗。
         """
         win = self.pill_window
         self.pill_window = None
         self._pill_embedded = False
         self._pill_bar_height = 0
         self._pill_geom = None
+        self._pill_hover_key = None
+        try:
+            if self._tip is not None:
+                self._tip.hide()
+        except Exception:
+            pass
         try:
             if win is not None:
                 win.destroy()
@@ -1977,12 +2165,31 @@ class WirelessStatusApp(object):
         return {"ok": True}
 
     def taskbar_metrics(self):
-        """贴片前端要的任务栏度量（高度档位 / 深浅色）。拿不到返回 {}。
+        """贴片前端要的任务栏度量（高度档位 / 深浅色 / 校准后的底色）。
 
         带上贴片自己的矩形 ``_pill_geom``（物理像素）：任务栏底色横向有
         渐变，全条取众数会得到一个比贴片周围暗十几级的灰 —— 实测贴片位置
         是薄荷色 (229,245,246)、整条众数是 (209,221,221)，贴片就像是按在
-        任务栏上的一个坑。传 near 让采样只看贴片左右邻域。
+        任务栏上的一个坑。传 near 让采样只看贴片自己的横向区间（上下留白
+        那两行），拿到的才是「这个位置本该是什么颜色」。
+
+        ============================================================
+        底色为什么要**校准**（务必保留这段）
+        ============================================================
+        扁平样式的贴片窗口底色必须和任务栏**逐像素一致**，否则就是一块
+        淡淡的方印子。而实测存在一条稳定偏移：
+
+            任务栏自己的像素       (221, 233, 233)
+            CSS 写 #dce8e8         (220, 232, 232)
+            屏幕上窗口实际渲染      (216, 234, 234)   ← R−4 G+2 B+2
+
+        纯 GDI 的 tkinter 窗口填同一个值，屏幕像素**同样**是
+        (216,234,234) —— 所以既不是采样错，也不是 WebView2 的锅，而是
+        显示器色彩管理在窗口合成那条路上做了一次变换（任务栏走另一条路）。
+
+        对策：每次上报前读回**上一次真正显示成什么颜色**
+        （``winui.window_interior_color``），把差值当补偿量加上去。不假设
+        任何 ICC 曲线，换显示器/换配置都能自己收敛。
         """
         geom = getattr(self, "_pill_geom", None)
         if not geom:
@@ -1998,8 +2205,31 @@ class WirelessStatusApp(object):
                     geom = (_g[0], _g[1], _g[2], _g[3])
             except Exception:
                 geom = None
-        return winui.taskbar_metrics(geom) or {}
 
+        metrics = winui.taskbar_metrics(geom) or {}
+
+        # 底色：沿贴片宽度采一组点，前端画成横向渐变。
+        #
+        # 为什么要渐变而不是纯色：Win11 任务栏横向有 8~20 级的渐变（实测通知
+        # 区附近 x=1700 是 (209,221,221)、x=2000 已是 (230,234,234)），贴片
+        # 宽 90px 就横跨这段。填一个纯色，无论取哪个点总有一条边对不上 ——
+        # 那就是肉眼看到的「一块淡淡的方印子」。
+        #
+        # 为什么**不**再叠色彩校准：实测过「读回窗口实际像素、把差值补上去」
+        # 的做法，它在这个环境下不收敛（写 (225,233,233) 屏幕回 (228,231,233)，
+        # 目标 (222,234,234) —— 每拍都在目标两侧来回跳，越修越花）。根因是
+        # 显示器色彩管理对窗口合成做的变换既不是加性偏移、也不完全单调。
+        # 渐变采样点已经是「这个位置本该是什么颜色」的最佳答案，误差落在
+        # 一两级以内，肉眼不可辨；再叠一层不可控的补偿只会更糟。
+        try:
+            prof = winui.taskbar_background_profile(geom) if geom else None
+        except Exception:
+            prof = None
+        metrics["profile"] = prof
+        if prof:
+            mid = prof[len(prof) // 2]
+            metrics["background"] = [mid[1], mid[2], mid[3]]
+        return metrics
 
 # ---------------------------------------------------------------- 单实例
 
@@ -2019,55 +2249,115 @@ def acquire_single_instance():
         return False
 
 
-def wake_existing():
-    """第二次启动时：找到已有实例的隐藏窗口，发消息让它显示窗口。"""
+def wake_existing(show=True):
+    """第二次启动时：让**已经在跑的那个实例**把窗口显示出来（可选）。
+
+    ⚠ 开机自启路径（``--silent``）不会走到这里 —— 详见 ``main()``：
+    需求 1 要求开机后静默，第二个实例必须悄悄退出，绝不能把窗口顶出来。
+
+    用命名事件而不是 ``PostMessage``：主窗的 WndProc 属于 pywebview
+    （WinForms），外部挂不上自己的消息处理，发自定义消息进去会被默认分支
+    吃掉、什么都不会发生。事件是纯 Win32，跨进程、无需窗口句柄，已有实例
+    的命令泵会顺手查到并自己走 ``show_window()``（那条路径才是线程安全的）。
+
+    拿不到事件（非 Windows / 权限）时退回老办法：直接 ``ShowWindow``。
+
+    返回 True 表示「已有实例收到了请求」。
+    """
+    signaled = False
     try:
-        hwnd = ctypes.windll.user32.FindWindowW(None, APP_TITLE)
-        if hwnd:
-            # 先让已有实例的窗口可见，再通知它重算位置
-            ctypes.windll.user32.ShowWindow(hwnd, 5)   # SW_SHOW
-            if WM_SHOW_EXISTING:
-                ctypes.windll.user32.PostMessageW(hwnd, WM_SHOW_EXISTING, 0, 0)
-            return True
+        kernel32 = ctypes.windll.kernel32
+        kernel32.OpenEventW.restype = ctypes.c_void_p
+        ev = kernel32.OpenEventW(EVENT_MODIFY_STATE, False, WAKE_EVENT_NAME)
+        if ev:
+            try:
+                kernel32.SetEvent(ctypes.c_void_p(ev))
+                signaled = True
+            finally:
+                kernel32.CloseHandle(ctypes.c_void_p(ev))
+    except Exception:
+        signaled = False
+
+    if not signaled and show:
+        try:
+            hwnd = ctypes.windll.user32.FindWindowW(None, APP_TITLE)
+            if hwnd:
+                ctypes.windll.user32.ShowWindow(hwnd, 5)   # SW_SHOW
+                signaled = True
+        except Exception:
+            pass
+    return signaled
+
+
+def _parse_args(argv):
+    """解析启动开关，返回 ``(show_at_start, silent)``。
+
+    两种形态，语义都是「这次启动**不要**弹窗」：
+
+      * 默认（裸启动）：静默 —— 只在托盘出现，不显示主窗；
+      * ``--silent``：同上，并且是**开机自启**写进注册表的那一条，
+        显式的意图声明（见 autostart.SILENT_FLAG）；
+      * ``--show``：调试用，起来就把主窗显示出来。
+
+    以前只有一个 ``--show`` 判断、其它一律静默，但「第二次启动」那条路径
+    会把已有实例的窗口顶出来 —— 需求 1 要的正是把那条路也堵上。所以现在
+    额外返回 ``explicit_show``：只有用户真的带上 ``--show`` 才允许唤窗。
+    """
+    args = [a.strip().lower() for a in (argv or [])]
+    explicit_show = any(a in ("--show", "/show", "-show") for a in args)
+    silent = any(a in ("--silent", "/silent", "-silent") for a in args)
+    # --show 优先于 --silent：调试时有 --show 就想看到窗口
+    return explicit_show, silent
+
+
+def _report_fatal(exc, silent=False):
+    """启动失败时落盘 + （非静默时）弹窗。
+
+    为什么静默路径**不弹**：``--silent`` 是开机自启那条路径，用户这时候
+    可能根本没坐在机器前。开机卡一个模态对话框，既挡住了后面所有自启项
+    （Windows 会等这个进程），又违背需求 1「静默开启」。日志照样写，
+    用户之后能查。
+    """
+    detail = traceback.format_exc()
+    try:
+        log = os.path.join(apppath.app_dir(), "error.log")
+        with open(log, "a", encoding="utf-8") as fh:
+            fh.write(detail + "\n")
+    except Exception:
+        log = "(日志写入失败)"
+    if silent:
+        return log
+    try:
+        # exe 是 -w 打的，没有控制台，异常必须弹出来，
+        # 否则用户只看到「双击没反应」。
+        ctypes.windll.user32.MessageBoxW(
+            None, "启动失败：%s\n\n%s\n\n详细堆栈：%s"
+            % (type(exc).__name__, exc, log), APP_TITLE, 0x10)
     except Exception:
         pass
-    return False
+    return log
 
 
 def main():
-    show_at_start = "--show" in sys.argv[1:]
+    show_at_start, silent = _parse_args(sys.argv[1:])
 
     handle = acquire_single_instance()
     if handle is None:
-        # 已经在跑：把它的窗口叫出来，然后自己退出。
-        # 这样「双击第二次」的预期行为是「窗口出现」，而不是「没反应」。
-        if not wake_existing():
-            try:
-                ctypes.windll.user32.MessageBoxW(
-                    None, "鼠标电量已经在运行了（看系统托盘）。", APP_TITLE, 0x40)
-            except Exception:
-                pass
+        # 已经在跑。这里**绝不弹任何对话框**（需求 1：静默）：
+        #   * 带 --show：说明用户是主动要打开界面 → 唤已有窗口；
+        #   * 其余（含开机自启的 --silent）：直接退出，什么都不做。
+        # 老代码在唤窗失败时还会弹一个「已经在运行了」的系统对话框，
+        # 开机时第二个实例必然走到那一支 —— 就是那个弹窗的来源。
+        if show_at_start:
+            wake_existing()
         return 0
 
     app = WirelessStatusApp(show_at_start=show_at_start)
     try:
         app.run()
     except Exception as exc:
-        # exe 是 -w 打的，没有控制台，异常必须落盘 + 弹窗，
-        # 否则用户只看到「双击没反应」。
-        detail = traceback.format_exc()
-        try:
-            log = os.path.join(apppath.app_dir(), "error.log")
-            with open(log, "a", encoding="utf-8") as fh:
-                fh.write(detail + "\n")
-        except Exception:
-            log = "(日志写入失败)"
-        try:
-            ctypes.windll.user32.MessageBoxW(
-                None, "启动失败：%s\n\n%s\n\n详细堆栈：%s"
-                % (type(exc).__name__, exc, log), APP_TITLE, 0x10)
-        except Exception:
-            pass
+        # 静默启动（开机那条）只落盘不弹窗，见 _report_fatal 的说明。
+        _report_fatal(exc, silent=not show_at_start)
         return 1
     return 0
 

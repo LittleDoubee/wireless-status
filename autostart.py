@@ -19,6 +19,20 @@ import sys
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 VALUE_NAME = "WirelessStatus"
 
+#: 本程序**历史上用过的**其它值名。旧版本把它当别名写过（MouseOverlay），
+#: 结果同一份脚本被注册两条 —— 开机时 explorer 起两个进程，第二个撞单实例
+#: 锁，老代码会 ShowWindow + MessageBox「已经在运行了」，用户看到的就是
+#: 「开机自己弹个窗」。所以启动时按值名删掉这些遗留项，只留一个。
+LEGACY_VALUE_NAMES = ("MouseOverlay",)
+
+#: 开机自启时追加的命令行开关。
+#:
+#: ``--silent`` 的含义是「这次是被开机拉起来的」：即使以后默认行为改成
+#: 「手动启动就显示窗口」，开机这条路径也必须**只出现在托盘里**，不弹窗、
+#: 不抢焦点。当前 main.py 默认就是静默，这个参数是显式的意图声明 + 未来
+#: 兼容，也方便用户在进程列表里一眼看出「这条是开机拉起的」。
+SILENT_FLAG = "--silent"
+
 
 def app_dir():
     """用户数据目录：exe 同目录 / 脚本目录（与 apppath.app_dir 一致）。"""
@@ -50,14 +64,18 @@ def pythonw_path():
 
 
 def launch_command():
-    """注册表里应该写的完整命令行。
+    """注册表里应该写的完整命令行（**总是带 ``--silent``**）。
 
-    两个路径都加引号：用户名带空格（C:\\Users\\Zhang San\\...）时不加引号
+    两个路径都加引号：用户名带空格（``C:\\Users\\Zhang San\\...``）时不加引号
     Windows 会把空格当参数分隔符，开机启动直接失败，而且**不报错**。
+
+    为什么要带 ``--silent``：开机拉起这条路径必须"存在即静默"。把它写进
+    注册表而不是只靠程序默认值，一是显式声明意图（以后默认值变了也不会
+    退化成开机弹窗），二是在任务管理器/进程列表里能直接看出来源。
     """
     if getattr(sys, "frozen", False):
-        return '"%s"' % target_path()
-    return '"%s" "%s"' % (pythonw_path(), target_path())
+        return '"%s" %s' % (target_path(), SILENT_FLAG)
+    return '"%s" "%s" %s' % (pythonw_path(), target_path(), SILENT_FLAG)
 
 
 def _open_key(write=False):
@@ -148,22 +166,75 @@ def set_enabled(on):
     return enable() if on else disable()
 
 
+def prune_legacy():
+    """删掉指向本程序的**遗留值名**（见 LEGACY_VALUE_NAMES）。返回删掉的个数。
+
+    为什么必须删：``WirelessStatus`` 和 ``MouseOverlay`` 两条都指向同一份
+    ``main.py`` 时，开机 explorer 会把两个进程都拉起来。第一个拿到单实例锁
+    正常静默运行，第二个拿不到锁 —— 老代码在那种情况下会 ``ShowWindow`` 把
+    已有窗口顶出来、还兜底弹一个 MessageBox。用户感知就是「开机后自己弹出
+    一个"已经在运行"的框」。删掉别名，从根上只剩一条启动路径。
+
+    只删**确认指向本程序**的值：值名是遗留别名、且命令行里出现本程序的
+    脚本名/exe 名才删。别的程序恰好用了同一个值名（极小概率）时不动它。
+    """
+    try:
+        import winreg
+    except ImportError:
+        return 0
+    removed = 0
+    own = _own_markers()
+    for name in LEGACY_VALUE_NAMES:
+        try:
+            with _open_key(write=True) as key:
+                try:
+                    value, _kind = winreg.QueryValueEx(key, name)
+                except FileNotFoundError:
+                    continue
+                if not _looks_like_own_command(value, own):
+                    continue
+                winreg.DeleteValue(key, name)
+                removed += 1
+        except FileNotFoundError:
+            continue
+        except OSError:
+            continue
+    return removed
+
+
+def _own_markers():
+    """本程序在命令行里必然出现的片段（脚本名 / exe 名）。"""
+    return ("wireless-status", "wirelessstatus", "main.py")
+
+
+def _looks_like_own_command(command, markers=None):
+    """命令行是否指向本程序。只做小写包含判断 —— 够了，不需要解析。"""
+    text = (command or "").lower()
+    if not text:
+        return False
+    return any(m in text for m in (markers or _own_markers()))
+
+
 def heal():
     """启动时自愈：注册表里的值指向的命令行与当前运行方式不符就重写。
 
     只在「用户确实启用过」时动手 —— 不启用时一个字节都不碰，避免把别人
     手动加的项悄悄改掉。返回 True 表示改动过。
+
+    顺带清理遗留别名（见 ``prune_legacy``）：那一条不会自愈，留着就是每次
+    开机双实例、第二个把窗口弹出来。
     """
+    pruned = prune_legacy()
     cmd = current_command()
     if not cmd:
-        return False
+        return bool(pruned)
     want = launch_command()
     if cmd.strip().lower() == want.strip().lower():
-        return False
+        return bool(pruned)
     path = _first_path(cmd)
     if path and os.path.exists(path):
         # 老路径仍然有效（比如同时留着源码和 exe），但运行方式可能变了，
         # 一律改成当前方式，保证「切换运行方式能自愈」。
         pass
     ok, _msg = enable()
-    return bool(ok)
+    return bool(ok) or bool(pruned)

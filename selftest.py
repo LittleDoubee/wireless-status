@@ -593,6 +593,16 @@ class TestAutostart(unittest.TestCase):
         self.assertTrue(cmd.startswith('"'))
         self.assertGreaterEqual(cmd.count('"'), 2)
 
+    def test_launch_command_carries_silent_flag(self):
+        """开机自启的命令行必须显式带 --silent（需求 1：不弹窗）。
+
+        只靠程序默认值不够：默认值以后改了，开机这条路径就会悄悄退化成
+        「弹窗」。写进注册表 = 显式意图，也方便在进程列表里认出来源。
+        """
+        cmd = autostart.launch_command()
+        self.assertIn(autostart.SILENT_FLAG, cmd,
+                      "开机自启命令行里必须有 %s" % autostart.SILENT_FLAG)
+
     def test_target_exists_in_source_run(self):
         self.assertTrue(os.path.exists(autostart.target_path()))
 
@@ -604,6 +614,7 @@ class TestAutostart(unittest.TestCase):
                 self.assertIn("WirelessStatus.exe", cmd)
                 self.assertNotIn("pythonw", cmd.lower())
                 self.assertNotIn(".py", cmd)
+                self.assertIn(autostart.SILENT_FLAG, cmd)
 
     def test_first_path_parsing(self):
         self.assertEqual(
@@ -617,6 +628,358 @@ class TestAutostart(unittest.TestCase):
         """读注册表失败（无 pywin32 / 无该项）必须返回 None 而不是抛。"""
         val = autostart.current_command()
         self.assertTrue(val is None or isinstance(val, str))
+
+    # ---- 遗留值名清理（开机弹窗的根因）
+    def test_legacy_names_declared(self):
+        """必须声明要清理的历史别名，否则双实例问题会回来。"""
+        self.assertIn("MouseOverlay", autostart.LEGACY_VALUE_NAMES)
+
+    def test_own_command_matching(self):
+        """只认指向本程序的命令行 —— 别人的同名值名不能被动。"""
+        self.assertTrue(autostart._looks_like_own_command(
+            '"D:\\application\\python3.10.11\\pythonw.exe" '
+            '"D:\\code\\dsh-workspace\\plugin\\wireless-status\\main.py"'))
+        self.assertTrue(autostart._looks_like_own_command(
+            '"C:\\Tools\\WirelessStatus.exe"'))
+        self.assertFalse(autostart._looks_like_own_command(
+            '"C:\\Other\\Notepad.exe"'))
+        self.assertFalse(autostart._looks_like_own_command(""))
+
+    def test_prune_legacy_never_raises(self):
+        """清理函数在没有该项/无权限时必须静默返回，不能影响启动。"""
+        self.assertIsInstance(autostart.prune_legacy(), int)
+
+
+# =============================================== 9b. 静默启动（需求 1）
+
+class TestSilentStartup(unittest.TestCase):
+    """开机自启后不再弹窗：参数解析 + 二次启动路径都要静默。"""
+
+    def setUp(self):
+        import main
+        self.main = main
+
+    def test_default_is_silent(self):
+        show, silent = self.main._parse_args([])
+        self.assertFalse(show, "默认启动不该显示窗口")
+        self.assertFalse(silent, "默认启动没有 --silent 标记")
+
+    def test_silent_flag_parsed(self):
+        show, silent = self.main._parse_args(["--silent"])
+        self.assertFalse(show)
+        self.assertTrue(silent)
+
+    def test_show_flag_parsed(self):
+        show, _silent = self.main._parse_args(["--show"])
+        self.assertTrue(show)
+
+    def test_show_wins_over_silent(self):
+        """两个都给时以 --show 为准（调试时要能看到窗口）。"""
+        show, _silent = self.main._parse_args(["--silent", "--show"])
+        self.assertTrue(show)
+
+    def test_flag_case_and_slash_forms(self):
+        for arg in ("--SILENT", "/silent", "-silent"):
+            self.assertTrue(self.main._parse_args([arg])[1],
+                            "%s 应被识别为静默开关" % arg)
+        for arg in ("--SHOW", "/show", "-show"):
+            self.assertTrue(self.main._parse_args([arg])[0],
+                            "%s 应被识别为显示开关" % arg)
+
+    def test_second_instance_has_no_messagebox(self):
+        """二次启动路径里**不许**再有系统弹窗（需求 1）。
+
+        老代码在唤窗失败时弹 MessageBox「已经在运行了」，开机时第二个实例
+        必然走到那一支 —— 那就是用户看到的弹窗。这条断言把路彻底堵死。
+        """
+        import inspect
+        src = inspect.getsource(self.main.main)
+        self.assertNotIn("MessageBoxW", src,
+                         "二次启动/主流程里不该再出现 MessageBoxW")
+
+    def test_fatal_error_is_silent_when_autostarted(self):
+        """开机路径下启动失败也必须静默（只落盘）—— 否则照样弹窗。
+
+        开机时弹一个模态框会挡住后面所有自启项，用户还常常不在机器前。
+        """
+        import inspect
+        src = inspect.getsource(self.main._report_fatal)
+        self.assertIn("if silent:", src, "静默分支必须存在")
+        # 弹窗调用必须在静默分支之后（即被 silent 守住）
+        self.assertLess(src.index("if silent:"), src.index("MessageBoxW"),
+                        "MessageBoxW 必须在静默早退之后")
+
+    def test_wake_only_when_show_requested(self):
+        """只有带了 --show 才允许唤窗；静默路径不能碰已有窗口。"""
+        import inspect
+        src = inspect.getsource(self.main.main)
+        self.assertIn("if show_at_start:", src,
+                      "唤窗必须被 show_at_start 守住")
+        self.assertIn("wake_existing()", src)
+
+    def test_wake_existing_tolerates_missing_event(self):
+        """没有已有实例（事件不存在）时必须安静返回 False，不能抛。
+
+        不能直接用真实的 ``WAKE_EVENT_NAME``：自测经常在**程序正在运行**时
+        执行，那时事件是存在的，SetEvent 会成功 —— 断言就随环境飘。这里换成
+        一个不可能存在的名字，测的才是"没有实例"这条分支。
+        """
+        old = self.main.WAKE_EVENT_NAME
+        self.main.WAKE_EVENT_NAME = "WirelessStatus.NoSuchEvent.selftest"
+        try:
+            self.assertFalse(self.main.wake_existing(show=False))
+        finally:
+            self.main.WAKE_EVENT_NAME = old
+
+    def test_wake_existing_signals_real_event(self):
+        """事件存在时 SetEvent 必须成功 —— 第二个实例靠它唤起已有窗口。"""
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        kernel32.CreateEventW.restype = ctypes.c_void_p
+        name = "WirelessStatus.SelftestEvent"
+        ev = kernel32.CreateEventW(None, True, False, name)
+        self.assertTrue(ev)
+        old = self.main.WAKE_EVENT_NAME
+        self.main.WAKE_EVENT_NAME = name
+        try:
+            self.assertTrue(self.main.wake_existing(show=False))
+            kernel32.ResetEvent(ctypes.c_void_p(ev))
+        finally:
+            self.main.WAKE_EVENT_NAME = old
+            kernel32.CloseHandle(ctypes.c_void_p(ev))
+
+    def test_wake_event_name_declared(self):
+        """跨进程唤窗靠命名事件，名字必须是常量（不能各处硬编码）。"""
+        self.assertTrue(self.main.WAKE_EVENT_NAME)
+        self.assertIn("WirelessStatus", self.main.WAKE_EVENT_NAME)
+
+
+# ===================================== 9c. 悬停提示（需求 4：名称 + 型号）
+
+class TestTipWindow(unittest.TestCase):
+
+    def setUp(self):
+        import tipwindow
+        self.tip = tipwindow
+
+    def _device(self, **kw):
+        d = {
+            "key": "B021_4080CFB3",
+            "display_name": "罗技 M350 Wireless Mouse",
+            "name": "M350 Wireless Mouse",
+            "pid": "B021",
+            "connection": {"label": "USB 接收器"},
+            "status": "online",
+            "status_text": "在线",
+            "battery": {"percent": 90, "supported": True},
+            "today_used": 7,
+        }
+        d.update(kw)
+        return d
+
+    def test_title_is_display_name(self):
+        """第一行必须是「品牌 + 型号」（需求 4 的「设备名称和型号」）。"""
+        title, _sub = self.tip.format_lines(self._device())
+        self.assertEqual(title, "罗技 M350 Wireless Mouse")
+
+    def test_title_has_model_not_pid(self):
+        """型号读得到时，标题里不该出现 PID 这种技术串。"""
+        title, sub = self.tip.format_lines(self._device())
+        self.assertNotIn("B021", title)
+        self.assertNotIn("PID", title)
+        self.assertNotIn("PID", sub)
+
+    def test_sub_line_carries_context(self):
+        _title, sub = self.tip.format_lines(self._device())
+        self.assertIn("USB 接收器", sub)
+        self.assertIn("90%", sub)
+        self.assertIn("今日用电", sub)
+
+    def test_pid_fallback_when_name_missing(self):
+        """型号读不到时才用 PID 补位 —— 否则用户判断不了这是哪只。"""
+        dev = self._device(display_name="罗技 未知型号", name="")
+        title, sub = self.tip.format_lines(dev)
+        self.assertEqual(title, "罗技 未知型号")
+        self.assertIn("B021", sub)
+
+    def test_unknown_battery_does_not_fake_percent(self):
+        """电量读不到就写「电量未知」，绝不显示 0%（那是在骗人）。"""
+        dev = self._device(battery={"percent": None, "supported": False})
+        _title, sub = self.tip.format_lines(dev)
+        self.assertIn("电量未知", sub)
+        self.assertNotIn("0%", sub)
+
+    def test_offline_status_shown(self):
+        dev = self._device(status="offline", status_text="离线")
+        _title, sub = self.tip.format_lines(dev)
+        self.assertIn("离线", sub)
+
+    def test_none_device(self):
+        title, sub = self.tip.format_lines(None)
+        self.assertEqual(title, "未知设备")
+        self.assertEqual(sub, "")
+
+    def test_battery_ok_helper(self):
+        self.assertTrue(self.tip.battery_ok({"percent": 50, "supported": True}))
+        self.assertFalse(self.tip.battery_ok({"percent": 50, "supported": False}))
+        self.assertFalse(self.tip.battery_ok({"percent": None, "supported": True}))
+        self.assertFalse(self.tip.battery_ok(None))
+
+    def test_window_not_created_before_start(self):
+        """没 start 之前不能有 hwnd，hide/show 必须安静地什么都不做。"""
+        win = self.tip.TipWindow()
+        self.assertIsNone(win.hwnd)
+        self.assertFalse(win.show("x", "y"))
+        self.assertFalse(win.hide())
+        self.assertFalse(win.visible)
+
+    def test_scaling_constants_sane(self):
+        """气泡尺寸是逻辑像素，档位关系要自洽（否则 150% 下会糊）。"""
+        self.assertLess(self.tip.PAD_X, self.tip.MAX_WIDTH)
+        self.assertGreater(self.tip.MIN_WIDTH, 0)
+        self.assertLessEqual(self.tip.MIN_WIDTH, self.tip.MAX_WIDTH)
+        self.assertGreaterEqual(self.tip.RADIUS, 0)
+
+
+# ================================== 9d. 贴片样式（需求 2/3：扁平单行 + 环形图标）
+
+class TestPillFlatStyle(unittest.TestCase):
+
+    def _read(self, name):
+        with io.open(os.path.join(HERE, "web", name), encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_pill_radius_is_zero(self):
+        """扁平样式必须直角：圆角会在四角露出与任务栏不一致的颜色。"""
+        import main
+        self.assertEqual(main.PILL_RADIUS, 0)
+
+    def test_pill_is_single_line_height(self):
+        """单行显示：窗口高度只够一行文字，不能是两行的高度。"""
+        import main
+        self.assertLessEqual(main.PILL_HEIGHT, 32,
+                             "单行贴片不该高过 32 逻辑像素")
+        self.assertGreaterEqual(main.PILL_HEIGHT, 20,
+                                "太矮会被裁字")
+
+    def test_css_has_no_capsule_background(self):
+        """CSS 里不能再有胶囊底色/内描边（那是旧样式）。"""
+        css = self._read("pill.css")
+        self.assertNotIn("box-shadow: inset", css, "还有胶囊内描边")
+        self.assertNotIn("border-radius: 7px", css)
+
+    def test_js_renders_inline_ring_icon(self):
+        """图标是环形电量表：内联 SVG 的底环 + 进度弧 + 闪电。"""
+        js = self._read("pill.js")
+        self.assertIn("ringIcon", js)
+        self.assertIn("stroke-dasharray", js, "进度弧要靠 dasharray 画")
+        self.assertIn("rotate(-90 12 12)", js, "弧要从 12 点方向起")
+        # 闪电的折线路径
+        self.assertIn("M14.9 5.4", js)
+
+    def test_js_reports_hover_to_backend(self):
+        """悬停必须走后端（HTML tooltip 会被 SetWindowRgn 裁掉）。"""
+        js = self._read("pill.js")
+        self.assertIn("set_pill_hover", js)
+        self.assertNotIn("chart-tip", js,
+                         "不该再有本地 HTML tooltip（看不见）")
+
+    def test_js_shows_all_devices_in_one_row(self):
+        """多设备并列一行（需求 3）：不能只取第一台。"""
+        js = self._read("pill.js")
+        self.assertIn("MAX_PILLS", js)
+        self.assertIn("slice(0, MAX_PILLS)", js)
+        self.assertIn("pill-wrap", self._read("pill.html"))
+
+    def test_html_has_no_tooltip_node(self):
+        html = self._read("pill.html")
+        self.assertNotIn("chart-tip", html)
+
+    def test_backend_exposes_hover_api(self):
+        """Api 与 App 两层都要有 set_pill_hover（前端调用点在上面已检查）。"""
+        import main
+        api = main.Api(None)
+        self.assertTrue(callable(getattr(api, "set_pill_hover", None)))
+        self.assertTrue(callable(getattr(main.WirelessStatusApp,
+                                          "_show_pill_tip", None)))
+
+    def test_server_pill_payload_has_tip_fields(self):
+        """气泡要用 display_name / pid / connection / battery.supported。"""
+        import inspect
+        src = inspect.getsource(server.Handler._pill)
+        for field in ("display_name", "pid", "connection", "supported",
+                      "status_text"):
+            self.assertIn(field, src, "贴片接口缺字段：%s" % field)
+
+    def test_pill_background_is_not_brightened(self):
+        """扁平样式下底色必须**原样**用采样值，不能提亮。"""
+        import inspect
+        import main
+        src = inspect.getsource(
+            main.WirelessStatusApp._pill_background_color)
+        self.assertNotIn("delta", src, "底色不该再提亮")
+
+
+# ======================================= 9e. 图标（需求 3：环 + 闪电，无深色底）
+
+class TestAppIcon(unittest.TestCase):
+
+    def setUp(self):
+        self.ico = os.path.join(HERE, "icon", "app.ico")
+        self.png = os.path.join(HERE, "icon", "app.png")
+
+    def test_icon_files_exist(self):
+        self.assertTrue(os.path.exists(self.ico), "缺 icon/app.ico")
+        self.assertTrue(os.path.exists(self.png), "缺 icon/app.png")
+
+    def test_ico_has_required_sizes(self):
+        """托盘要 16/20/24/32，资源管理器要大图 —— 缺档会拉大图缩，模糊。"""
+        from PIL import Image
+        with Image.open(self.ico) as im:
+            sizes = set(im.ico.sizes())
+        for need in ((16, 16), (20, 20), (24, 24), (32, 32), (48, 48),
+                     (256, 256)):
+            self.assertIn(need, sizes, "ico 缺 %dx%d" % need)
+
+    def test_icon_corners_transparent(self):
+        """需求 3：**不要**深色圆角方块 —— 四角必须是透明的。"""
+        from PIL import Image
+        with Image.open(self.png) as im:
+            im = im.convert("RGBA")
+            for xy in ((0, 0), (im.width - 1, 0),
+                       (0, im.height - 1), (im.width - 1, im.height - 1)):
+                alpha = im.getpixel(xy)[3]
+                self.assertEqual(alpha, 0,
+                                 "四角应透明（不要方块底），实测 %r" % (xy,))
+
+    def test_icon_is_ring_not_filled_disc(self):
+        """圆心要是**空的**（环），只在正中有闪电。
+
+        采样圆心的左上方（远离闪电的一格）：那里若是实心色块，说明画成了
+        圆盘而不是环。
+        """
+        from PIL import Image
+        with Image.open(self.png) as im:
+            im = im.convert("RGBA")
+            w = im.width
+            # 圆心正上方、环内 —— 环是 8.4/12 半径、线宽 3.4，所以
+            # 0.30*w 处应在环内（透明）
+            alpha = im.getpixel((w // 2, int(w * 0.30)))[3]
+            self.assertEqual(alpha, 0, "环内应该是空的（透明）")
+
+    def test_icon_uses_reference_colors(self):
+        """配色对齐参考图：绿色 #14D448 与环灰 #7F8083。"""
+        import tools.make_icon as maker
+        self.assertEqual(maker.GREEN[:3], (19, 212, 72))
+        self.assertEqual(maker.GREY[:3], (127, 128, 130))
+
+    def test_maker_is_runnable(self):
+        """生成脚本必须能独立跑（以后改配色不用求人重画）。"""
+        import inspect
+        import tools.make_icon as maker
+        self.assertTrue(callable(maker.render))
+        self.assertIn("--preview", inspect.getsource(maker.main))
+
 
 
 # =================================================== 11. 电量换算（battery.py）

@@ -253,7 +253,19 @@ class Handler(BaseHTTPRequestHandler):
         return today
 
     def _pill(self):
-        """贴片专用：只给在线设备的三四个字段，不拉整份快照。"""
+        """贴片专用：只给在线设备的那几个字段，不拉整份快照。
+
+        字段是**贴片前端 + 悬停气泡**的联合契约（``web/pill.js`` 用前几个，
+        ``tipwindow.format_lines`` 用后几个）：
+
+          * ``key/icon/kind``        —— 图标与去重
+          * ``display_name``         —— 「罗技 M350 Wireless Mouse」，气泡第一行
+          * ``pid``                  —— 只在型号读不到时气泡才会显示
+          * ``connection.label``     —— 气泡第二行「USB 接收器」
+          * ``battery.percent``      —— 数值（贴片就显示这个）
+          * ``battery.level``        —— good/low/critical/empty/unknown，配色
+          * ``today_used``           —— 气泡第二行「今日用电 x%」
+        """
         provider = self.provider
         if provider is None:
             return {"ok": False, "devices": []}
@@ -273,9 +285,15 @@ class Handler(BaseHTTPRequestHandler):
                 "kind": d.get("kind"),
                 "name": d.get("name") or "",
                 "display_name": d.get("display_name") or "",
+                "pid": d.get("pid") or "",
+                "connection": {"label": (d.get("connection") or {}).get("label", "")},
                 "status": d.get("status"),
+                "status_text": d.get("status_text") or "",
                 "level": d.get("level") or "unknown",
-                "battery": {"percent": bat.get("percent")},
+                "battery": {
+                    "percent": bat.get("percent"),
+                    "supported": bool(bat.get("supported")),
+                },
                 "today_used": self._today_used(d.get("key")),
             })
         return {"ok": True, "devices": out, "total": len(devices)}
