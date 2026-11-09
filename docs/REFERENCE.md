@@ -8,7 +8,7 @@
 `app.js` + `style.css`。
 
 界面分两页：**设备列表**（一屏看到所有配对设备与电量）→ **设备功能区**
-（电量、电量历史、DPI、使用时长）。还可以在任务栏上贴一行电量（环形图标 + 数值）。
+（电量、电量历史、DPI、使用时长）。还可以在任务栏上贴一行电量（设备类型图标 + 数值）。
 
 ```
 wireless-status/
@@ -232,7 +232,7 @@ pyinstaller -F -w --name WirelessStatus --icon icon\app.ico ^
 | 已运行 | 打开功能区 | `HH:MM:SS` 每秒跳动，无「最后操作时间」；停止操作后再走满 5 秒冻住，不往回跳 |
 | 位置不漂 | 开/关贴片、点设备、返回列表 | 窗口左边界与底边全程不动，只有高度跟着内容变 |
 | 鼠标移出 | 移开鼠标等 2 秒 | 窗口自动收起 |
-| 贴片 | 打开列表页底部的贴片开关 | 任务栏上出现**单行**「环形电量图标 + 90%」，没有底色块/描边/圆角 |
+| 贴片 | 打开列表页底部的贴片开关 | 任务栏上出现**单行**「设备类型图标 + 90%」，没有底色块/描边/圆角 |
 | 贴片长在任务栏里 | 右键任务栏 → 任务栏设置 → 打开「自动隐藏」再退出设置 | 贴片跟着任务栏一起缩下去（不是浮在上面） |
 | 贴片开关独占 | 打开后等几分钟 | 一直显示，不会自己消失；关开关 1 秒内消失 |
 | 贴片不挡点击 | 点贴片旁边的任务栏图标 | 能正常点到 |
@@ -379,7 +379,7 @@ v2 起几何已经改走纯 Win32（不带 `SWP_SHOWWINDOW`），这个问题从
 cmd /c start.bat
 Start-Sleep 10
 # 期望 False；如果是 True，说明某处 move 后没补 _restore_visibility()
-python -c "import ctypes;u=ctypes.windll.user32;h=u.FindWindowW(None,'鼠标电量');print(bool(u.IsWindowVisible(h)))"
+python -c "import ctypes;u=ctypes.windll.user32;h=u.FindWindowW(None,'Wireless Status');print(bool(u.IsWindowVisible(h)))"
 ```
 
 ### 窗口高度不跟着内容走 / 一直是大片空白
@@ -485,10 +485,12 @@ x=2000 → (230, 234, 234)
 
 三个原因叠在一起，必须一起修：
 
-1. **注册表有两条**。旧版本除 `WirelessStatus` 之外还写过别名
-   `MouseOverlay`，两条指向同一份脚本 —— 开机时 explorer 起两个进程。
-   修法：`autostart.prune_legacy()` 启动时清掉**确认指向本程序**的历史别名
-   （别人的同名项不动，判断靠 `_looks_like_own_command`）。
+1. **注册表有两条**。同一个程序在 `Run` 下被注册两条时，开机 explorer 会把
+   两个进程都拉起来。修法：`autostart.prune_legacy()` 启动时遍历 `Run`，
+   凡是**命令行指向本程序**、值名又不是规范名的项一律删掉
+   （判断靠 `_looks_like_own_command`，别人的项不动）。
+   ——按命令行内容判断，而不是"写死某个旧名字"：后者每改一次名就得回来补
+   一次黑名单，而且旧名字会一直留在代码里。
 2. **第二个实例会唤窗**。老代码拿不到单实例锁就 `ShowWindow` 把已有窗口
    顶出来。修法：只有显式带 `--show` 才唤窗，其余（含开机 `--silent`）
    静默退出。

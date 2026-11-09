@@ -29,31 +29,11 @@
     unknown: "lv-unknown"
   };
 
-  //: 档位 → 环的颜色。与 pill.css 里 .lv-* 的色值保持一致：同一块屏幕上
-  //: 「环」和「数字」表达同一个状态，颜色不能打架。
-  var LEVEL_COLOR = {
-    good: "#12b51f",
-    low: "#b57500",
-    critical: "#d1541f",
-    empty: "#cf222e",
-    unknown: "#8a8f96"
-  };
-
-  var LEVEL_COLOR_DARK = {
-    good: "#45e05a",
-    low: "#e3b341",
-    critical: "#ff8a5c",
-    empty: "#ff7b72",
-    unknown: "#b8bcc2"
-  };
-
   var wrap = null;
   var api = null;
   var lastWidth = 0;
   var widthTimer = null;
   var isDark = false;
-  //: 当前悬停的设备 key。重复上报同一台时不再打 api（避免每帧一次跨进程调用）。
-  var hoverKey = null;
 
   function el(tag, cls) {
     var e = document.createElement(tag);
@@ -61,68 +41,64 @@
     return e;
   }
 
-  // ------------------------------------------------------------ 环形电量图标
+  // ------------------------------------------------------------ 设备图标
 
   /**
-   * 画一枚环形电量表（内联 SVG，不发请求）。
+   * 取一台设备的**类型图标**（鼠标 / 键盘 / 耳机 / 手柄…）。
    *
-   * 为什么内联而不是用 icon/*.svg：
-   *   * 每台设备的弧长不同，静态文件表达不了；
-   *   * 贴片页只有一个窗口、最多 4 个图标，内联省掉 4 次 HTTP + 一次
-   *     onerror 兜底分支 —— 之前那套 `img.onerror → 换内联 SVG` 的双路径
-   *     在 exe 里一旦路径不对就整块空掉，实测过。
+   * 需求：贴片要显示"这是什么设备"，而不是一个和电量绑定的环形表。
+   * 电量已经由旁边的数字表达了，图标再画一遍电量是重复信息；用设备形状
+   * 反而能一眼看出"这一格是鼠标、那一格是耳机"——多设备并列时尤其重要。
    *
-   * 几何：viewBox 24×24，半径 8.4、线宽 3.4（=外径 76%，和 app.ico 一致）。
-   * 进度从 12 点方向顺时针 —— `rotate(-90)` 把 SVG 的 3 点起点转到 12 点。
+   * 图标来自 ``icon/<kind>.svg``（Lucide，ISC 许可，stroke=currentColor），
+   * 由后端 ``/api/pill`` 的 ``icon`` 字段给名字。加载失败时退回内置的
+   * 极简兜底形状，绝不留白（空图标在 16px 下就是一个洞）。
    */
-  function ringIcon(percent, level) {
-    var palette = isDark ? LEVEL_COLOR_DARK : LEVEL_COLOR;
-    var color = palette[level] || palette.unknown;
-    var pct = (percent === null || percent === undefined) ? 0 : percent;
-    pct = Math.max(0, Math.min(100, pct));
+  var DEV_FALLBACK = {
+    mouse: '<rect x="5" y="2" width="14" height="20" rx="7"/><path d="M12 6v4"/>',
+    keyboard: '<rect width="20" height="16" x="2" y="4" rx="2"/>' +
+              '<path d="M6 8h.01M10 8h.01M14 8h.01M18 8h.01M8 12h.01M12 12h.01M16 12h.01M7 16h10"/>',
+    headset: '<path d="M3 14h3a2 2 0 0 1 2 2v3a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-7a9 9 0 0 1 18 0v7a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3"/>',
+    gamepad: '<rect width="20" height="12" x="2" y="6" rx="2"/>' +
+             '<path d="M6 12h4M8 10v4"/>' +
+             '<path d="M15 13h.01M18 11h.01"/>',
+    unknown: '<rect x="4" y="7" width="16" height="10" rx="2"/>'
+  };
 
-    var r = 8.4;
-    var circ = 2 * Math.PI * r;
-    var dash = circ * pct / 100;
+  /** 把 icon 名字规范成兜底表里的键。后端给的是 ``kind``/``icon`` 字段。 */
+  function iconKey(name) {
+    var k = String(name || "").toLowerCase();
+    if (k === "headphones" || k === "headphone" || k === "earbud" ) { return "headset"; }
+    if (k === "keyboard" || k === "mouse" || k === "gamepad" || k === "headset") { return k; }
+    return "unknown";
+  }
 
-    var ns = "http://www.w3.org/2000/svg";
-    var svg = document.createElementNS(ns, "svg");
-    svg.setAttribute("viewBox", "0 0 24 24");
-    svg.setAttribute("aria-hidden", "true");
+  /**
+   * 造一个设备图标节点。
+   *
+   * 优先用 ``<img src="/icon/<name>.svg">``（后端能换图标文件，不用改 JS）；
+   * 加载失败时替换成内联 SVG 兜底。两者尺寸/描边完全一致 —— 图标是
+   * ``stroke=currentColor``，颜色跟着数字所在行的前景走，深浅主题自动适配。
+   */
+  function deviceIcon(name) {
+    var key = iconKey(name);
+    var holder = el("span", "dev-ico");
 
-    // 底环：整圈灰，表示 100% 的位置
-    var base = document.createElementNS(ns, "circle");
-    base.setAttribute("cx", "12");
-    base.setAttribute("cy", "12");
-    base.setAttribute("r", String(r));
-    base.setAttribute("fill", "none");
-    base.setAttribute("stroke", isDark ? "rgba(255,255,255,0.30)" : "rgba(0,0,0,0.26)");
-    base.setAttribute("stroke-width", "3.4");
-    svg.appendChild(base);
-
-    // 进度弧
-    if (pct > 0) {
-      var arc = document.createElementNS(ns, "circle");
-      arc.setAttribute("cx", "12");
-      arc.setAttribute("cy", "12");
-      arc.setAttribute("r", String(r));
-      arc.setAttribute("fill", "none");
-      arc.setAttribute("stroke", color);
-      arc.setAttribute("stroke-width", "3.4");
-      arc.setAttribute("stroke-linecap", "butt");
-      arc.setAttribute("stroke-dasharray", dash.toFixed(2) + " " + circ.toFixed(2));
-      // -90°：把弧的起点从 3 点转到 12 点
-      arc.setAttribute("transform", "rotate(-90 12 12)");
-      svg.appendChild(arc);
-    }
-
-    // 环内闪电（和 app.ico 同一个折线）
-    var bolt = document.createElementNS(ns, "path");
-    bolt.setAttribute("d", "M14.9 5.4 L9.6 12.3 L12.4 12.3 L11.4 18.6 L16.3 11.3 L13.5 11.3 Z");
-    bolt.setAttribute("fill", color);
-    svg.appendChild(bolt);
-
-    return svg;
+    var img = document.createElement("img");
+    img.alt = "";
+    img.width = 16;
+    img.height = 16;
+    img.src = "/icon/" + (key === "unknown" ? "unknown" : key) + ".svg";
+    img.onerror = function () {
+      var ns = "http://www.w3.org/2000/svg";
+      var svg = document.createElementNS(ns, "svg");
+      svg.setAttribute("viewBox", "0 0 24 24");
+      svg.setAttribute("aria-hidden", "true");
+      svg.innerHTML = DEV_FALLBACK[key] || DEV_FALLBACK.unknown;
+      if (img.parentNode) { img.parentNode.replaceChild(svg, img); }
+    };
+    holder.appendChild(img);
+    return holder;
   }
 
   // ------------------------------------------------------------ 底色推导
@@ -196,8 +172,15 @@
     if (!kids.length) { return; }
 
     var total = 0;
+    var segments = [];
     for (var i = 0; i < kids.length; i++) {
-      total += kids[i].getBoundingClientRect().width;
+      var box = kids[i].getBoundingClientRect();
+      total += box.width;
+      // 只把**设备位**报给后端（「+N」「无设备」不是设备，悬停它们没意义）
+      var key = kids[i].dataset ? kids[i].dataset.key : "";
+      if (key) {
+        segments.push([key, box.left, box.width]);
+      }
     }
 
     var cs = window.getComputedStyle(wrap);
@@ -214,6 +197,30 @@
       lastWidth = w;
       if (api && api.set_pill_width) { api.set_pill_width(w); }
     }
+    reportSegments(segments);
+  }
+
+  //: 上一次上报的分段，避免每 60ms 重复跨进程调用
+  var lastSegSig = "";
+
+  /**
+   * 把每个设备位的横坐标/宽度报给后端。
+   *
+   * 后端靠它把「光标 x」换算成「哪台设备」—— 悬停气泡**不再依赖网页的
+   * mouseenter**：贴片窗是任务栏子窗口 + WS_EX_NOACTIVATE，实测 WebView2
+   * 在这种窗口里收不到鼠标进出事件（前端 mouseenter 一次都不触发，往
+   * set_pill_hover 里打日志从头到尾是空的）。所以前端只上报"布局"，
+   * 判断"在不在、在谁身上"由后端量真实光标做。
+   *
+   * 坐标用 getBoundingClientRect 的视口坐标 —— 贴片页的视口就是窗口本身，
+   * 所以它天然就是"相对贴片左边缘"的像素，后端再乘 DPI 换算成屏幕坐标。
+   */
+  function reportSegments(segments) {
+    if (!api || !api.set_pill_segments) { return; }
+    var sig = JSON.stringify(segments);
+    if (sig === lastSegSig) { return; }
+    lastSegSig = sig;
+    api.set_pill_segments(segments);
   }
 
   function scheduleReportSize() {
@@ -228,30 +235,17 @@
     }, 60);
   }
 
-  // ------------------------------------------------------------ 悬停
+  // ---------------------------------------------------------- 悬停（后端驱动）
 
-  /**
-   * 把悬停状态报给 Python。
-   *
-   * 后端会据此弹一个独立的 Win32 气泡（设备名 + 型号/连接/电量）。
-   * 这里**不做任何本地 tooltip** —— WebView2 画不出被 SetWindowRgn 裁掉的
-   * 窗口边界之外，本地 tooltip 一定看不见。
-   *
-   * 去重：同一台设备连续 mouseenter 只上报一次；mouseleave 只在"确实悬停着"
-   * 时上报，避免指针在格子之间移动时把气泡收掉又立刻弹出来（会闪）。
-   */
-  function reportHover(key, hovering) {
-    if (!api || !api.set_pill_hover) { return; }
-    if (hovering) {
-      if (hoverKey === key) { return; }
-      hoverKey = key;
-      api.set_pill_hover(key, true);
-    } else {
-      if (hoverKey === null) { return; }
-      hoverKey = null;
-      api.set_pill_hover("", false);
-    }
-  }
+  /* 悬停提示**完全由后端驱动**：后端命令泵每 0.2s 量一次真实光标位置，
+     判断指针在不在贴片矩形里、落在哪个设备位上，然后自己弹 tipwindow。
+
+     前端在这里只做一件事：把每台设备占的横坐标/宽度报上去
+     （reportSegments），否则后端不知道"光标在这台身上"是哪一台。
+
+     **不要**在贴片上加 mouseenter/mouseleave —— 实测那几个事件在任务栏
+     子窗口里一次都不触发（原因见 reportSegments 的注释）。
+  */
 
   // ------------------------------------------------------------ 渲染
 
@@ -266,7 +260,7 @@
     pill.dataset.key = dev.key || "";
 
     var ico = el("span", "dev-ico");
-    ico.appendChild(ringIcon(pct, level));
+    ico.appendChild(deviceIcon(dev.icon || dev.kind));
 
     var txt = el("span", "pill-pct " + cls);
     txt.textContent = (pct === null || pct === undefined) ? "—" : (pct + "%");
@@ -277,14 +271,6 @@
     pill.addEventListener("click", function () {
       if (api && api.open_window) { api.open_window(); }
     });
-    // 指针进出都上报；格子之间移动会先 leave 再 enter，靠后端去重吸收
-    pill.addEventListener("mouseenter", function () {
-      reportHover(dev.key || "", true);
-    });
-    pill.addEventListener("mouseleave", function () {
-      reportHover("", false);
-    });
-
     return pill;
   }
 
@@ -295,8 +281,7 @@
     });
 
     wrap.innerHTML = "";
-    hoverKey = null;
-    if (api && api.set_pill_hover) { api.set_pill_hover("", false); }
+    reportSegments([]);
 
     if (!online.length) {
       var empty = el("span", "pill-more");

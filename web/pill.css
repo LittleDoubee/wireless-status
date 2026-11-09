@@ -123,11 +123,20 @@ body.pill-page.bar-dark {
   color: var(--pill-text);
 }
 
+/* 图标是 Lucide 的**线稿**（fill:none + stroke:currentColor）。
+   16px 下默认 2px 描边会糊成一团，降到 1.8；颜色跟前景走，不跟电量染色 ——
+   否则一行四个格子全是撞色的小彩块，反而看不出是设备图标。 */
 .pill .dev-ico img,
 .pill .dev-ico svg {
   width: 16px;
   height: 16px;
   display: block;
+  color: var(--pill-text);
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
 
 .pill .ico-fallback {
@@ -142,6 +151,11 @@ body.pill-page.bar-dark {
 .pill .ico-fallback svg {
   width: 16px;
   height: 16px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
 
 /* 百分比文字。等宽数字，电量跳变时不会左右抖（LiteMonitor 的数值列
@@ -155,18 +169,31 @@ body.pill-page.bar-dark {
   color: inherit;
 }
 
-/* 电量分档配色 —— 与列表页共用同一组色值（需求：配色统一）。
-   LiteMonitor 的做法也是「数值本身染色、标签保持深色」，所以这里只染数值。 */
-.lv-good { color: #12b51f; }
+/* 电量分档配色 —— **完全对齐 LiteMonitor**（需求 3）。
+ *
+ * 色值取自 LiteMonitor 的 settings.json：
+ *     TaskbarColorSafe  #008040   ← 安全
+ *     TaskbarColorWarn  #B57500   ← 警告
+ *     TaskbarColorCrit  #C03030   ← 严重
+ *
+ * LiteMonitor 的做法是「数值本身染色、标签保持深色」，所以这里只染数值，
+ * 设备图标走 currentColor 保持前景色（不跟着电量变，否则一眼全是彩色）。
+ *
+ * 「严重」以下还有一档 empty（电量耗尽），是 LiteMonitor 没有的极端态：
+ * 用比 Crit 更深一档的同色相红，语义上"比严重还严重"。
+ */
+.lv-good { color: #008040; }
 .lv-low { color: #b57500; }
-.lv-critical { color: #d1541f; }
-.lv-empty { color: #cf222e; font-weight: 700; }
+.lv-critical { color: #c03030; }
+.lv-empty { color: #9e2323; font-weight: 700; }
 .lv-unknown { color: var(--pill-dim); }
 
-body.pill-page.bar-dark .lv-good { color: #45e05a; }
-body.pill-page.bar-dark .lv-low { color: #e3b341; }
-body.pill-page.bar-dark .lv-critical { color: #ff8a5c; }
-body.pill-page.bar-dark .lv-empty { color: #ff7b72; }
+/* 深色任务栏：LiteMonitor 的那三色是为浅色任务栏调的，压在深底上太暗。
+   色相不变、只提亮 —— 深色下"同一个语义"要更亮的同色才等价。 */
+body.pill-page.bar-dark .lv-good { color: #23b463; }
+body.pill-page.bar-dark .lv-low { color: #d69a26; }
+body.pill-page.bar-dark .lv-critical { color: #e2564e; }
+body.pill-page.bar-dark .lv-empty { color: #f0736b; }
 
 /* 「+N」与「无设备」 */
 .pill-more {

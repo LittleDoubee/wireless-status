@@ -629,13 +629,10 @@ class TestAutostart(unittest.TestCase):
         val = autostart.current_command()
         self.assertTrue(val is None or isinstance(val, str))
 
-    # ---- 遗留值名清理（开机弹窗的根因）
-    def test_legacy_names_declared(self):
-        """必须声明要清理的历史别名，否则双实例问题会回来。"""
-        self.assertIn("MouseOverlay", autostart.LEGACY_VALUE_NAMES)
+    # ---- 重复自启项清理（开机弹窗的根因）
 
     def test_own_command_matching(self):
-        """只认指向本程序的命令行 —— 别人的同名值名不能被动。"""
+        """按**命令行内容**识别本程序 —— 这是清理重复项的唯一依据。"""
         self.assertTrue(autostart._looks_like_own_command(
             '"D:\\application\\python3.10.11\\pythonw.exe" '
             '"D:\\code\\dsh-workspace\\plugin\\wireless-status\\main.py"'))
@@ -644,6 +641,48 @@ class TestAutostart(unittest.TestCase):
         self.assertFalse(autostart._looks_like_own_command(
             '"C:\\Other\\Notepad.exe"'))
         self.assertFalse(autostart._looks_like_own_command(""))
+        # 别的 python 脚本不能被误判（只有带本程序路径的才算）
+        self.assertFalse(autostart._looks_like_own_command(
+            '"D:\\application\\python3.10.11\\pythonw.exe" '
+            '"D:\\code\\other-tool\\autostart.py"'))
+
+    def test_no_legacy_name_hardcoded(self):
+        """不许再靠"历史值名黑名单"清理 —— 旧名字不该留在代码里。
+
+        这条断言是给以后的自己看的：遇到重复自启项，改**判断逻辑**
+        （按命令行内容识别），不要把某个旧名字写回常量里。
+        """
+        self.assertFalse(hasattr(autostart, "LEGACY_VALUE_NAMES"),
+                         "不该再有 LEGACY_VALUE_NAMES 这种硬编码黑名单")
+
+    def test_repo_has_no_stale_project_name(self):
+        """整个仓库不该再出现老项目名（会被当成还在维护的名字）。
+
+        老名字以**拆分拼接**的方式存进断言里，避免这行本身又变成一处"包含
+        该字样"的文件 —— 那样 grep 出来永远有一条，反而碍事。
+        """
+        stale = "Mouse" + "Overlay"
+        roots = [".", "web", "icon", "tools", "docs"]
+        hits = []
+        for root in roots:
+            for base, _dirs, files in os.walk(os.path.join(HERE, root)):
+                if any(skip in base for skip in ("build", "dist", "__pycache__",
+                                                 ".git")):
+                    continue
+                for name in files:
+                    if not name.lower().endswith(
+                            (".py", ".js", ".css", ".html", ".md", ".json",
+                             ".bat", ".spec", ".txt", ".svg")):
+                        continue
+                    path = os.path.join(base, name)
+                    try:
+                        with io.open(path, encoding="utf-8",
+                                     errors="ignore") as fh:
+                            if stale.lower() in fh.read().lower():
+                                hits.append(os.path.relpath(path, HERE))
+                    except OSError:
+                        pass
+        self.assertEqual(hits, [], "这些文件里还留着老项目名：%s" % hits)
 
     def test_prune_legacy_never_raises(self):
         """清理函数在没有该项/无权限时必须静默返回，不能影响启动。"""
@@ -843,6 +882,45 @@ class TestTipWindow(unittest.TestCase):
 
 # ================================== 9d. 贴片样式（需求 2/3：扁平单行 + 环形图标）
 
+class TestDeviceKinds(unittest.TestCase):
+    """设备类型推断与图标映射 —— 面向"任意无线设备"，不写死鼠标。"""
+
+    def test_all_kinds_have_icon_and_label(self):
+        """每种类型都必须有图标名和中文名，否则界面会露 fallback。"""
+        for kind in (devices.KIND_MOUSE, devices.KIND_KEYBOARD,
+                     devices.KIND_HEADSET, devices.KIND_GAMEPAD,
+                     devices.KIND_UNKNOWN):
+            self.assertIn(kind, devices.KIND_ICON, "缺图标映射：%s" % kind)
+            self.assertIn(kind, devices.KIND_LABEL, "缺中文名：%s" % kind)
+            icon = devices.KIND_ICON[kind]
+            path = os.path.join(HERE, "icon", icon + ".svg")
+            self.assertTrue(os.path.exists(path),
+                            "icon/%s.svg 不存在（类型 %s）" % (icon, kind))
+
+    def test_unknown_is_not_mouse(self):
+        """认不出来的设备不能长成鼠标 —— 那会误导用户。"""
+        self.assertNotEqual(devices.KIND_ICON[devices.KIND_UNKNOWN],
+                            devices.KIND_ICON[devices.KIND_MOUSE])
+
+    def test_guess_kind_by_name(self):
+        cases = [
+            ("M350 Wireless Mouse", devices.KIND_MOUSE),
+            ("MX Keys S Keyboard", devices.KIND_KEYBOARD),
+            ("Zone Wired Headset", devices.KIND_HEADSET),
+            ("F710 Gamepad", devices.KIND_GAMEPAD),
+            ("罗技 无线键盘", devices.KIND_KEYBOARD),
+            ("罗技 耳机", devices.KIND_HEADSET),
+        ]
+        for name, want in cases:
+            self.assertEqual(devices.guess_kind(name), want,
+                             "%r 应该判成 %s" % (name, want))
+
+    def test_guess_kind_falls_back_to_unknown(self):
+        """不认识的名字兜底 unknown，不是 mouse。"""
+        self.assertEqual(devices.guess_kind("XYZ-1000"), devices.KIND_UNKNOWN)
+        self.assertEqual(devices.guess_kind(""), devices.KIND_UNKNOWN)
+
+
 class TestPillFlatStyle(unittest.TestCase):
 
     def _read(self, name):
@@ -868,14 +946,36 @@ class TestPillFlatStyle(unittest.TestCase):
         self.assertNotIn("box-shadow: inset", css, "还有胶囊内描边")
         self.assertNotIn("border-radius: 7px", css)
 
-    def test_js_renders_inline_ring_icon(self):
-        """图标是环形电量表：内联 SVG 的底环 + 进度弧 + 闪电。"""
+    def test_js_uses_device_icon_not_ring(self):
+        """贴片图标必须是**设备类型图标**（鼠标/键盘/耳机/手柄），不是电量环。
+
+        需求：电量由数字表达，图标负责"这是什么设备"。多设备并列时尤其重要
+        —— 一行四个格子全靠图标区分谁是谁。
+        """
         js = self._read("pill.js")
-        self.assertIn("ringIcon", js)
-        self.assertIn("stroke-dasharray", js, "进度弧要靠 dasharray 画")
-        self.assertIn("rotate(-90 12 12)", js, "弧要从 12 点方向起")
-        # 闪电的折线路径
-        self.assertIn("M14.9 5.4", js)
+        self.assertIn("deviceIcon", js)
+        self.assertNotIn("ringIcon", js, "环形电量图标应该已经下线")
+        self.assertNotIn("stroke-dasharray", js, "不再画进度弧")
+
+    def test_device_icon_files_exist(self):
+        """四类设备的图标文件都必须在 ``icon/`` 下（Lucide，ISC）。"""
+        for name in ("mouse", "keyboard", "headset", "gamepad", "unknown"):
+            path = os.path.join(HERE, "icon", name + ".svg")
+            self.assertTrue(os.path.exists(path), "缺图标：icon/%s.svg" % name)
+            with io.open(path, encoding="utf-8") as fh:
+                svg = fh.read()
+            self.assertIn("viewBox=\"0 0 24 24\"", svg,
+                          "%s.svg 的 viewBox 不对" % name)
+            self.assertIn("currentColor", svg,
+                          "%s.svg 要跟随前景色（深浅主题自动适配）" % name)
+            self.assertIn("ISC", svg, "%s.svg 要保留 Lucide 的 ISC 许可头" % name)
+
+    def test_pill_colors_match_litemonitor(self):
+        """数字配色对齐 LiteMonitor 的 settings.json（需求 3）。"""
+        css = self._read("pill.css")
+        for hexval in ("#008040", "#b57500", "#c03030"):
+            self.assertIn(hexval, css.lower(),
+                          "缺少 LiteMonitor 的色值 %s" % hexval)
 
     def test_js_reports_hover_to_backend(self):
         """悬停必须走后端（HTML tooltip 会被 SetWindowRgn 裁掉）。"""
@@ -896,12 +996,33 @@ class TestPillFlatStyle(unittest.TestCase):
         self.assertNotIn("chart-tip", html)
 
     def test_backend_exposes_hover_api(self):
-        """Api 与 App 两层都要有 set_pill_hover（前端调用点在上面已检查）。"""
+        """悬停靠**后端轮询光标**实现，不是网页事件。
+
+        * ``_poll_pill_hover``：命令泵里量真实光标位置；
+        * ``_pill_key_at``：把光标 x 换算成"哪台设备"；
+        * ``set_pill_segments``：前端只上报布局。
+        """
         import main
+        app = main.WirelessStatusApp
+        for name in ("_poll_pill_hover", "_pill_key_at", "_show_pill_tip",
+                     "set_pill_segments", "_refresh_tip_if_stale"):
+            self.assertTrue(callable(getattr(app, name, None)),
+                            "App 缺方法：%s" % name)
         api = main.Api(None)
-        self.assertTrue(callable(getattr(api, "set_pill_hover", None)))
-        self.assertTrue(callable(getattr(main.WirelessStatusApp,
-                                          "_show_pill_tip", None)))
+        self.assertTrue(callable(getattr(api, "set_pill_segments", None)))
+
+    def test_js_does_not_rely_on_mouse_events(self):
+        """贴片**不能**靠 mouseenter 触发悬停 —— 实测收不到。
+
+        贴片窗是 ``Shell_TrayWnd`` 的子窗口 + ``WS_EX_NOACTIVATE``，这种状态
+        下 WebView2 不把鼠标进出事件喂给页面（实测一次都不触发），所以那套
+        实现"看起来对、实际永远不生效"。前端只上报布局，判断交给后端。
+        """
+        js = self._read("pill.js")
+        self.assertNotIn('addEventListener("mouseenter"', js)
+        self.assertNotIn('addEventListener("mouseleave"', js)
+        self.assertIn("set_pill_segments", js)
+        self.assertIn("reportSegments", js)
 
     def test_server_pill_payload_has_tip_fields(self):
         """气泡要用 display_name / pid / connection / battery.supported。"""

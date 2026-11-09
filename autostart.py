@@ -19,11 +19,16 @@ import sys
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 VALUE_NAME = "WirelessStatus"
 
-#: 本程序**历史上用过的**其它值名。旧版本把它当别名写过（MouseOverlay），
-#: 结果同一份脚本被注册两条 —— 开机时 explorer 起两个进程，第二个撞单实例
-#: 锁，老代码会 ShowWindow + MessageBox「已经在运行了」，用户看到的就是
-#: 「开机自己弹个窗」。所以启动时按值名删掉这些遗留项，只留一个。
-LEGACY_VALUE_NAMES = ("MouseOverlay",)
+#: 清理重复自启项时的**值名白名单之外**的排除项。
+#:
+#: 不用"历史值名黑名单"：那要求代码里写死一个旧名字，改名换姓后又得回来
+#: 改一次，而且名字本身就是不该继续出现在仓库里的东西。
+#:
+#: 改用**按命令行内容判断**：``HKCU\...\Run`` 下凡是「指向本程序」且不是
+#: 规范值名 ``VALUE_NAME`` 的项，都是历史遗留或手动添加的重复项，一律删掉。
+#: 判断依据是命令行里出现本程序的特征路径（脚本名 / exe 名），因此改多少次
+#: 名字都不会漏，也不会误删别的软件。
+_OWN_MARKERS = ("wireless-status", "wirelessstatus", "main.py")
 
 #: 开机自启时追加的命令行开关。
 #:
@@ -167,52 +172,62 @@ def set_enabled(on):
 
 
 def prune_legacy():
-    """删掉指向本程序的**遗留值名**（见 LEGACY_VALUE_NAMES）。返回删掉的个数。
+    """删掉 ``Run`` 下**指向本程序**的重复项（规范值名保留）。返回删掉的个数。
 
-    为什么必须删：``WirelessStatus`` 和 ``MouseOverlay`` 两条都指向同一份
-    ``main.py`` 时，开机 explorer 会把两个进程都拉起来。第一个拿到单实例锁
-    正常静默运行，第二个拿不到锁 —— 老代码在那种情况下会 ``ShowWindow`` 把
-    已有窗口顶出来、还兜底弹一个 MessageBox。用户感知就是「开机后自己弹出
-    一个"已经在运行"的框」。删掉别名，从根上只剩一条启动路径。
+    ============================================================
+    为什么需要（血泪，别再改回"写死旧名字"）
+    ============================================================
+    同一个程序在 ``Run`` 里被注册两条时，开机 explorer 会把两个进程都拉起来。
+    第一个拿到单实例锁正常静默运行，第二个拿不到锁 —— 老代码在那种情况下会
+    ``ShowWindow`` 把已有窗口顶出来、还兜底弹一个 MessageBox。用户感知就是
+    「开机后自己弹出一个"已经在运行"的框」。
 
-    只删**确认指向本程序**的值：值名是遗留别名、且命令行里出现本程序的
-    脚本名/exe 名才删。别的程序恰好用了同一个值名（极小概率）时不动它。
+    早期实现靠"历史值名黑名单"（把老名字写进常量）来清。那种做法有两个问题：
+      1. 老名字会一直留在代码/文档里，成为不该存在的历史包袱；
+      2. 再改一次名，黑名单就又漏了。
+
+    所以改成**按命令行内容识别**：遍历 ``Run``，命令行里出现本程序特征路径、
+    且值名不是规范的 ``VALUE_NAME`` 的，就是重复项，删掉。
+    这样不管是哪一版留下的、还是用户手动加的别名，都能收干净。
     """
     try:
         import winreg
     except ImportError:
         return 0
     removed = 0
-    own = _own_markers()
-    for name in LEGACY_VALUE_NAMES:
-        try:
-            with _open_key(write=True) as key:
+    try:
+        with _open_key(write=True) as key:
+            names = []
+            index = 0
+            while True:
                 try:
-                    value, _kind = winreg.QueryValueEx(key, name)
-                except FileNotFoundError:
+                    name, value, _kind = winreg.EnumValue(key, index)
+                except OSError:
+                    break
+                index += 1
+                if name == VALUE_NAME:
                     continue
-                if not _looks_like_own_command(value, own):
-                    continue
-                winreg.DeleteValue(key, name)
-                removed += 1
-        except FileNotFoundError:
-            continue
-        except OSError:
-            continue
+                if _looks_like_own_command(value):
+                    names.append(name)
+            for name in names:
+                try:
+                    winreg.DeleteValue(key, name)
+                    removed += 1
+                except OSError:
+                    pass
+    except FileNotFoundError:
+        return 0
+    except OSError:
+        return 0
     return removed
 
 
-def _own_markers():
-    """本程序在命令行里必然出现的片段（脚本名 / exe 名）。"""
-    return ("wireless-status", "wirelessstatus", "main.py")
-
-
-def _looks_like_own_command(command, markers=None):
+def _looks_like_own_command(command):
     """命令行是否指向本程序。只做小写包含判断 —— 够了，不需要解析。"""
     text = (command or "").lower()
     if not text:
         return False
-    return any(m in text for m in (markers or _own_markers()))
+    return any(m in text for m in _OWN_MARKERS)
 
 
 def heal():

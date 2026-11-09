@@ -45,16 +45,24 @@ import mouse_source
 # ---------------------------------------------------------------- 设备种类
 
 KIND_MOUSE = "mouse"
+KIND_KEYBOARD = "keyboard"
 KIND_HEADSET = "headset"
 KIND_GAMEPAD = "gamepad"
 KIND_UNKNOWN = "unknown"
 
-#: 种类 → 图标文件名（不含扩展名）。图标缺失时前端走内联 SVG 兜底。
+#: 种类 → 图标文件名（不含扩展名）= ``icon/<name>.svg``。
+#:
+#: 加新设备类型时**只需要**改这里 + KIND_LABEL + KIND_HINTS，再往 icon/ 放一个
+#: 同名 SVG；前端的贴片图标、列表图标、详情页条件显示都跟着走，不用改 JS。
+#:
+#: 兜底用 ``unknown`` 而不是 ``mouse``：以前兜底指向 mouse，结果任何没识别出来
+#: 的设备都长成一只鼠标，误导性很强。``unknown`` 画的是一个通用设备框。
 KIND_ICON = {
     KIND_MOUSE: "mouse",
+    KIND_KEYBOARD: "keyboard",
     KIND_HEADSET: "headset",
     KIND_GAMEPAD: "gamepad",
-    KIND_UNKNOWN: "mouse",
+    KIND_UNKNOWN: "unknown",
 }
 
 #: 品牌。目前只支持罗技（HID++ 走的就是它的私有协议），所以固定值；
@@ -90,29 +98,43 @@ def display_name_of(name, pid=""):
 
 KIND_LABEL = {
     KIND_MOUSE: "鼠标",
+    KIND_KEYBOARD: "键盘",
     KIND_HEADSET: "耳机",
     KIND_GAMEPAD: "手柄",
     KIND_UNKNOWN: "设备",
 }
 
-#: 产品名里的关键词 → 种类。只做**明显的**判断，判不出来的算 mouse
-#: （因为本轮只有鼠标，误判成耳机反而更糟）。
+#: 产品名里的关键词 → 种类。只做**明显的**判断。
+#:
+#: 顺序有意义：先匹配到的赢。所以"无线**键盘**鼠标套装"这类组合名要留神 ——
+#: 单个 HID++ 设备通常只报自己的名字，不会出现组合名，这里按"最具体的先"排：
+#: 耳机 > 手柄 > 键盘 > 鼠标（"keyboard" 里不含 "mouse"，正常不会互相误伤）。
+#:
+#: 加新类型时在这里补关键词，并把该类型排到合适的位置。
 KIND_HINTS = (
     (KIND_HEADSET, ("headset", "headphone", "earbud", "zone ", "g pro x 2 light",
                     "耳机", "耳麦")),
-    (KIND_GAMEPAD, ("gamepad", "controller", "手柄", "f310", "f710", "f920")),
-    (KIND_MOUSE, ("mouse", "mice", "鼠标", "trackball", "ergo")),
+    (KIND_GAMEPAD, ("gamepad", "controller", "手柄", "f310", "f710", "f920",
+                    "joystick", "摇杆")),
+    (KIND_KEYBOARD, ("keyboard", "keypad", "键盘", "k380", "k400", "k850",
+                     "mx keys", "craft")),
+    (KIND_MOUSE, ("mouse", "mice", "鼠标", "trackball", "ergo", "轨迹球")),
 )
 
 
 def guess_kind(name, pids=None):
-    """按产品名猜种类。判不出来返回 mouse（本轮只有鼠标）。"""
+    """按产品名猜种类。判不出来返回 ``unknown``。
+
+    为什么不兜底成 mouse：以前兜底 mouse，任何没识别的设备都长成一只鼠标，
+    用户看到"耳机"分类下挂着鼠标图标会以为程序坏了。``unknown`` 至少诚实：
+    它画的是一个通用设备框，配合提示气泡里的真实型号名，用户自己能判断。
+    """
     text = (name or "").lower()
     for kind, words in KIND_HINTS:
         for w in words:
             if w in text:
                 return kind
-    return KIND_MOUSE
+    return KIND_UNKNOWN
 
 
 # ---------------------------------------------------------------- 接口

@@ -74,7 +74,7 @@ class TrayIcon(object):
     回调只往队列里塞一个事件（见 main.py 的 WirelessStatusApp._post）。
     """
 
-    def __init__(self, tooltip="鼠标电量", on_toggle=None, on_refresh=None,
+    def __init__(self, tooltip="Wireless Status", on_toggle=None, on_refresh=None,
                  on_autostart=None, on_exit=None, icon_path=None,
                  on_show=None):
         self.tooltip = tooltip[:120]     # NOTIFYICONDATA 的 szTip 上限 128

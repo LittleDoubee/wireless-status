@@ -51,8 +51,14 @@ import tipwindow
 import usage
 import winui
 
-APP_TITLE = "鼠标电量"
-PILL_TITLE = "鼠标电量贴片"
+#: 应用名（窗口标题、托盘提示、错误对话框统一用这一个）。
+#:
+#: 起名口径：**不绑定任何品牌或设备类型**。它要管的是"所有无线外设的电量"，
+#: 鼠标只是当下接入的第一种；将来接键盘、耳机、手柄时，名称不用再改。
+#: 也因此标题里不能出现"鼠标"二字。
+APP_TITLE = "Wireless Status"
+#: 贴片窗的标题。只用于 ``FindWindow`` 定位，用户在界面上看不到。
+PILL_TITLE = "Wireless Status Pill"
 APP_VERSION = apppath.APP_VERSION   # 收口到 apppath，托盘提示和 /api/ping 必须是同一个
 
 MUTEX_NAME = "WirelessStatus.SingleInstance.v3"
@@ -385,13 +391,15 @@ class Api(object):
         """前端量出贴片胶囊的实际宽度，窗口跟着收窄（剪掉左边空白）。"""
         return self._app.set_pill_width(width)
 
-    def set_pill_hover(self, key="", hovering=False):
-        """贴片悬停：显示 / 收起设备信息气泡（需求 4）。
+    def set_pill_segments(self, segments):
+        """贴片每台设备占的格子（逻辑像素），后端据此判断指针落在谁身上。
 
-        气泡是**独立的 Win32 顶层窗**（``tipwindow.py``）—— WebView2 画不出
-        贴片窗口之外的东西，用 HTML tooltip 会被 SetWindowRgn 裁掉。
+        为什么让前端算：只有 DOM 知道每台设备实际多宽（图标 + 数字 + 间距，
+        随字号档位变化）。后端硬算要对一遍字体度量，纯属重复劳动。
+
+        ``segments`` 形如 ``[["B021_4080", 0, 46], ["B022_1122", 46, 44]]``。
         """
-        return self._app.set_pill_hover(key, hovering)
+        return self._app.set_pill_segments(segments)
 
     def open_window(self):
         return self._app.open_window()
@@ -590,8 +598,13 @@ class WirelessStatusApp(object):
         #: 悬停提示气泡（独立 Win32 顶层窗，见 tipwindow.py）。懒启动 ——
         #: 贴片开关关着时完全不会创建线程。
         self._tip = None
-        #: 当前指针悬停的设备 key（前端上报），None = 没悬停
+        #: 当前指针悬停的设备 key，None = 没悬停（由 _poll_pill_hover 维护）
         self._pill_hover_key = None
+        #: 前端上报的贴片分段布局 ``[[key, left, width], ...]``（逻辑像素，
+        #: 相对贴片窗口左边缘）。后端按它判断指针落在哪台设备上。
+        self._pill_segments = None
+        #: 上一次气泡显示的签名，用来判断"电量变了要不要刷新"
+        self._pill_tip_sig = None
         #: 「第二个实例请我显示窗口」的命名事件句柄（见 _poll_post_message）
         self._wake_event = None
 
@@ -970,6 +983,10 @@ class WirelessStatusApp(object):
                         self._poll_cursor_leave()
                     except Exception:
                         pass
+                    try:
+                        self._poll_pill_hover()
+                    except Exception:
+                        pass
                     continue
                 try:
                     self._run_command(cmd)
@@ -982,6 +999,10 @@ class WirelessStatusApp(object):
                     pass
                 try:
                     self._poll_cursor_leave()
+                except Exception:
+                    pass
+                try:
+                    self._poll_pill_hover()
                 except Exception:
                     pass
         t = threading.Thread(target=loop, name="cmd-pump", daemon=True)
@@ -1114,6 +1135,103 @@ class WirelessStatusApp(object):
             self._reposition()
         except Exception:
             traceback.print_exc()
+
+    def _poll_pill_hover(self):
+        """按**真实光标位置**判断指针在不在贴片上，直接驱动悬停气泡。
+
+        ============================================================
+        为什么不用前端的 mouseenter / mouseleave（血泪，别改回去）
+        ============================================================
+        贴片窗被 ``SetParent`` 挂成了 ``Shell_TrayWnd`` 的**子窗口**，并且设了
+        ``WS_EX_NOACTIVATE``。实测在这种状态下 WebView2 **收不到鼠标进入/
+        离开事件** —— 前端 ``mouseenter`` 一次都不触发（往 ``set_pill_hover``
+        里打日志，从头到尾是空的），所以气泡永远不会出现。
+
+        同一时刻 DOM 的 hit-test 仍然正常（``WindowFromPoint`` 指向
+        ``Chrome_RenderWidgetHostHWND``），也就是说消息进了子窗口，但没被
+        Chromium 的输入管线喂给页面。
+
+        所以改由后端量真实光标位置 —— 和 ``_poll_cursor_leave`` 完全同一个
+        思路：命令泵 0.2s 一拍，``GetCursorPos`` 跟 DOM 事件一点关系都没有。
+
+        行为：
+          * 指针进入贴片矩形 → 找出它落在**哪一台设备**的格子里（按前端上报
+            的分段宽度算），弹对应设备的气泡；
+          * 指针离开 → 收起；
+          * 悬停中设备电量变了 → 气泡内容跟着刷新（不然显示的是旧数值）。
+        """
+        if self._tip is None:
+            return
+        geom = getattr(self, "_pill_geom", None)
+        if not geom:
+            return
+        pos = winui.cursor_pos()
+        if not pos:
+            return
+        x, y = pos
+        px, py, pw, ph = geom
+        inside = (px <= x <= px + pw) and (py <= y <= py + ph)
+
+        if not inside:
+            if self._pill_hover_key:
+                self._pill_hover_key = None
+                try:
+                    self._tip.hide()
+                except Exception:
+                    pass
+            return
+
+        key = self._pill_key_at(x)
+        if not key:
+            return
+        if key == self._pill_hover_key and self._tip.visible:
+            # 已经在显示同一台：只在天数变化时刷新内容，不重复 SetWindowPos
+            self._refresh_tip_if_stale(key)
+            return
+        self._pill_hover_key = key
+        self._show_pill_tip(key)
+
+    def _pill_key_at(self, screen_x):
+        """光标横坐标 ``screen_x`` 落在哪一台设备的格子上，返回它的 key。
+
+        ``self._pill_segments`` 是前端上报的 ``[[key, x, w], ...]``（**逻辑
+        像素**，相对贴片窗口左边缘）。为什么让前端算：只有 DOM 知道每台设备
+        实际占多宽（图标 + 数字 + 间距，随字号档位变化），后端硬算要对一遍
+        字体度量，纯属重复劳动。
+        """
+        segments = getattr(self, "_pill_segments", None)
+        if not segments:
+            # 前端还没上报（页面刚起）：退回"整条贴片 = 第一台设备"
+            devs = [d for d in (self._last_devices or [])
+                    if d.get("status") == "online"]
+            return devs[0].get("key") if devs else None
+        geom = getattr(self, "_pill_geom", None) or (0, 0, 0, 0)
+        scale = dpi_scale() or 1.0
+        rel = (screen_x - int(geom[0])) / scale
+        for seg in segments:
+            try:
+                key, left, width = seg[0], float(seg[1]), float(seg[2])
+            except (TypeError, ValueError):
+                continue
+            if left <= rel <= left + width:
+                return key
+        return None
+
+    def _refresh_tip_if_stale(self, key):
+        """悬停期间电量/状态变了就刷新气泡内容（否则显示的是旧读数）。"""
+        dev = None
+        for d in (self._last_devices or []):
+            if d.get("key") == key:
+                dev = d
+                break
+        if dev is None:
+            return
+        sig = (dev.get("display_name"), (dev.get("battery") or {}).get("percent"),
+               dev.get("today_used"), dev.get("status_text"))
+        if sig == getattr(self, "_pill_tip_sig", None):
+            return
+        self._pill_tip_sig = sig
+        self._show_pill_tip(key)
 
     def _poll_cursor_leave(self):
         """指针离开主窗满 ``AUTO_HIDE_SEC`` 就自动收起（需求 3）。
@@ -1449,6 +1567,22 @@ class WirelessStatusApp(object):
         self._pill_hover_key = key
         shown = self._show_pill_tip(key)
         return {"ok": True, "shown": bool(shown)}
+
+    def set_pill_segments(self, segments):
+        """前端上报贴片各设备位的横坐标与宽度（逻辑像素，相对贴片左边缘）。
+
+        后端用它把"光标 x"换算成"哪台设备"，从而弹出**对应那台**的气泡。
+        多设备并列时这一步是必须的 —— 否则只要指针在贴片范围内，弹的永远
+        是第一台的信息。
+        """
+        out = []
+        for seg in segments or []:
+            try:
+                out.append([str(seg[0]), float(seg[1]), float(seg[2])])
+            except (TypeError, ValueError, IndexError):
+                continue
+        self._pill_segments = out or None
+        return {"ok": True, "count": len(out)}
 
     def _show_pill_tip(self, key):
         """按 key 找到设备并弹出提示气泡。返回是否显示成功。"""
@@ -1966,6 +2100,10 @@ class WirelessStatusApp(object):
         （比如一边写「今日用电」一边写「今日用量」）。
 
         托盘提示是单行的（``szTip`` 128 字符上限），所以两行拼成一行。
+
+        **软件名永远打头**：鼠标划过托盘图标，第一眼要看到"这是什么程序"，
+        而不是先看到设备型号。所以格式固定为
+        ``Wireless Status — <设备> <关键信息>``。
         """
         if self.tray is None:
             return
@@ -1977,7 +2115,8 @@ class WirelessStatusApp(object):
             tip = "%s — %d 台设备均已离线" % (APP_TITLE, len(devs))
         else:
             title, sub = tipwindow.format_lines(online[0])
-            tip = "%s — %s" % (title, sub) if sub else title
+            detail = "%s %s" % (title, sub) if sub else title
+            tip = "%s — %s" % (APP_TITLE, detail)
             if len(devs) > 1:
                 tip += "（共 %d 台）" % len(devs)
         if tip != getattr(self, "_last_tip", None):
