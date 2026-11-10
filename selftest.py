@@ -691,6 +691,127 @@ class TestAutostart(unittest.TestCase):
 
 # =============================================== 9b. 静默启动（需求 1）
 
+# ================================== 9b-2. 生命周期日志与脱离 DSH 启动
+
+class TestLifecycleLog(unittest.TestCase):
+    """程序"莫名其妙没了"要能自证 —— 靠 lifecycle.log 的时间线。"""
+
+    def setUp(self):
+        import main
+        self.main = main
+
+    def test_lifecycle_log_helper_exists(self):
+        self.assertTrue(callable(getattr(self.main, "_lifecycle", None)))
+
+    def test_lifecycle_log_writes_to_file(self):
+        """_lifecycle 要真的落一条，不能只是空壳。"""
+        import apppath
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "lifecycle.log")
+            # 临时把 app_dir 指到临时目录，别污染程序目录
+            old = apppath.app_dir
+            apppath.app_dir = lambda: tmp
+            try:
+                self.main._lifecycle("单元测试写入")
+            finally:
+                apppath.app_dir = old
+            self.assertTrue(os.path.exists(path), "lifecycle.log 没生成")
+            with io.open(path, encoding="utf-8") as fh:
+                body = fh.read()
+            self.assertIn("单元测试写入", body)
+
+    def test_lifecycle_never_raises(self):
+        """写日志失败绝不能把主流程带崩。"""
+        import apppath
+        old = apppath.app_dir
+        apppath.app_dir = lambda: "/definitely/not/a/dir/xxx"
+        try:
+            self.main._lifecycle("这条写不进去，但绝不能抛")
+        except Exception as exc:
+            self.fail("_lifecycle 不该抛异常：%r" % exc)
+        finally:
+            apppath.app_dir = old
+
+    def test_exit_paths_are_logged(self):
+        """关键退出节点必须写日志，否则"它怎么没的"永远查不出来。"""
+        import inspect
+        targets = [
+            self.main.WirelessStatusApp.shutdown,
+            self.main.WirelessStatusApp.quit,
+            self.main.main,
+            self.main._report_fatal,
+        ]
+        for func in targets:
+            src = inspect.getsource(func)
+            self.assertIn("_lifecycle(", src,
+                          "%s 里没有写生命周期日志" % func.__name__)
+
+    def test_quit_records_source(self):
+        """退出请求要记录**来源**（托盘菜单 / 界面按钮），便于区分
+        「用户主动退」和「自己退掉的」。"""
+        import inspect
+        src = inspect.getsource(self.main.WirelessStatusApp.quit)
+        self.assertIn("source", src)
+        self.assertIn("_lifecycle(", src)
+
+    def test_tray_thread_exit_is_logged(self):
+        """托盘线程退出也要记一行 —— 托盘图标没了但程序还在，是两回事。"""
+        import inspect
+        import tray
+        src = inspect.getsource(tray.TrayIcon._run)
+        self.assertIn("_lifecycle(", src)
+
+
+class TestDetachedLaunch(unittest.TestCase):
+    """脱离 Job Object 的启动通道（launcher.py）。"""
+
+    def setUp(self):
+        import launcher
+        self.launcher = launcher
+
+    def test_module_exists(self):
+        self.assertTrue(callable(self.launcher.detach_launch))
+
+    def test_launch_args_use_pythonw_and_silent(self):
+        """脱离启动必须用 pythonw（不弹黑框）且带 --silent（不弹窗）。"""
+        args = self.launcher.launch_args(show=False)
+        self.assertTrue(args[0].lower().endswith("pythonw.exe"))
+        self.assertIn("--silent", args)
+        self.assertIn("main.py", " ".join(args).lower())
+
+    def test_launch_args_show_flag(self):
+        args = self.launcher.launch_args(show=True)
+        self.assertIn("--show", args)
+        self.assertNotIn("--silent", args)
+
+    def test_command_length_limit_checked(self):
+        """schtasks /tr 有 261 字符上限，超了必须回退而不是硬发。"""
+        self.assertEqual(self.launcher.SCHTASKS_CMD_LIMIT, 261)
+        ok, why = self.launcher.detach_launch(["x" * 400], label="test")
+        self.assertFalse(ok, "超长命令行不该被接受")
+        self.assertIn("字符", why)
+
+    def test_empty_command_rejected(self):
+        ok, why = self.launcher.detach_launch([], label="test")
+        self.assertFalse(ok)
+        self.assertIn("空", why)
+
+    def test_task_name_carries_pid_and_time(self):
+        """任务名必须带 pid + 时间戳 —— 复用同一个名字会踩"任务正在运行
+        → /run 返回 0 但并不启动新进程"的坑（那个项目实测白等 20 秒）。"""
+        import re
+        import inspect
+        src = inspect.getsource(self.launcher.detach_launch)
+        self.assertIn("TASK_PREFIX", src)
+        self.assertIn("os.getpid()", src, "任务名里要有 pid")
+        self.assertIn("time.time()", src, "任务名里要有时间戳")
+        # 名字的形状：前缀_pid_数字
+        sample = "%s_%d_%d" % (self.launcher.TASK_PREFIX, os.getpid(), 123456)
+        self.assertTrue(re.match(r"^%s_\d+_\d+$" % re.escape(self.launcher.TASK_PREFIX),
+                                 sample), "任务名形状不对：%s" % sample)
+
+
 class TestSilentStartup(unittest.TestCase):
     """开机自启后不再弹窗：参数解析 + 二次启动路径都要静默。"""
 
@@ -919,6 +1040,142 @@ class TestDeviceKinds(unittest.TestCase):
         """不认识的名字兜底 unknown，不是 mouse。"""
         self.assertEqual(devices.guess_kind("XYZ-1000"), devices.KIND_UNKNOWN)
         self.assertEqual(devices.guess_kind(""), devices.KIND_UNKNOWN)
+
+
+class TestPillSelfHeal(unittest.TestCase):
+    """任务栏重建后贴片要能自愈（explorer 一重启贴片不该永久消失）。"""
+
+    def setUp(self):
+        import main
+        self.main = main
+
+    def test_notify_area_missing_falls_back(self):
+        """通知区还没出现时不能直接放弃 —— 要退回任务栏右端。
+
+        以前这里 ``return None``，于是任务栏刚重建的几秒里读不到几何，
+        ``_apply_pill_host`` 提前返回、**根本没调 SetParent**，贴片就永远
+        挂不上任务栏（变成飘在桌面上的顶层窗口）。
+        """
+        import inspect
+        import winui
+        src = inspect.getsource(winui.pill_rect_in_taskbar)
+        self.assertIn("TrayNotifyWnd", src, "注释里要说明为什么需要兜底")
+        self.assertNotIn("    if not bar or not note:\n        return None",
+                         src, "通知区缺失时不能直接返回 None")
+
+    def test_setparent_check_uses_getparent(self):
+        """SetParent 的返回值是"旧父窗口"，不能拿它判成败。
+
+        旧父为 NULL 时它返回 0 —— 那是"原来没有父"，不是失败。必须看
+        ``GetParent`` 的当前值。
+        """
+        import inspect
+        import winui
+        src = inspect.getsource(winui.embed_in_taskbar)
+        self.assertIn("GetParent", src)
+        self.assertTrue(callable(getattr(winui, "window_parent", None)))
+        self.assertTrue(callable(getattr(winui, "window_style", None)))
+
+    def test_embed_records_failure_reason(self):
+        """挂载失败要留下原因，否则排查时只知道 False、不知道卡在哪。"""
+        import winui
+        self.assertTrue(hasattr(winui, "LAST_EMBED_ERROR"))
+
+    def test_pill_hwnd_falls_back_to_cache(self):
+        """运行期创建的窗口拿不到 native 句柄时，要退回句柄缓存。
+
+        少了这个回退，``_apply_pill_host`` 第一行就 return False —— 贴片
+        永远挂不上任务栏。
+        """
+        import inspect
+        src = inspect.getsource(self.main.WirelessStatusApp._pill_hwnd)
+        self.assertIn("_hwnd_cache", src)
+
+    def test_self_heal_checks_position_too(self):
+        """自愈不只看父窗口，还要看位置对不对。
+
+        任务栏重建后通知区要过几秒才出现，这期间贴片只能贴在任务栏最右端；
+        通知区出来之后得把它往左挪，否则会压在时钟上。
+        """
+        import inspect
+        src = inspect.getsource(self.main.WirelessStatusApp._poll_taskbar_change)
+        self.assertIn("window_parent", src)
+        self.assertIn("_pill_geom", src)
+        self.assertIn("位置正确", src)
+
+    def test_self_heal_is_throttled(self):
+        """自愈要限速，不能每 0.2 秒重挂一次。"""
+        import inspect
+        src = inspect.getsource(self.main.WirelessStatusApp._poll_taskbar_change)
+        self.assertIn("_pill_retry_at", src)
+        self.assertIn("2.0", src)
+
+
+class TestPillLifecycle(unittest.TestCase):
+    """贴片跟主窗**同生共死**：一起建、一起退，中间只切显隐。
+
+    用户原话：「贴片就应该跟着主窗一样开启一起退出」。
+    """
+
+    def setUp(self):
+        import main
+        self.main = main
+
+    def test_pill_window_created_regardless_of_switch(self):
+        """启动时**总是**建贴片窗，开关只决定显示与否。"""
+        import inspect
+        src = inspect.getsource(self.main.WirelessStatusApp.run)
+        self.assertIn("self._create_pill_window(url)", src)
+        # 不能再有"开关关就不建窗"那种写法
+        self.assertNotIn('if self.store.config.get("battery_pill_enabled")',
+                         src, "贴片窗不该再按开关决定建不建")
+
+    def test_switch_only_toggles_visibility(self):
+        """开关走的是 _set_pill_visible，不是销毁/重建。"""
+        import inspect
+        src = inspect.getsource(self.main.WirelessStatusApp.set_pill_enabled)
+        self.assertIn("_set_pill_visible", src)
+        self.assertNotIn("_destroy_pill_window", src,
+                         "开关不该再销毁贴片窗（同生共死）")
+
+    def test_visibility_helper_exists(self):
+        self.assertTrue(callable(getattr(self.main.WirelessStatusApp,
+                                          "_set_pill_visible", None)))
+
+    def test_taskbar_self_heal_exists(self):
+        """任务栏被重建（explorer 重启）后要能自愈贴片。"""
+        app = self.main.WirelessStatusApp
+        for name in ("_poll_taskbar_change", "_rebuild_pill_window"):
+            self.assertTrue(callable(getattr(app, name, None)),
+                            "App 缺方法：%s" % name)
+
+    def test_taskbar_heal_is_polled(self):
+        """自愈检查必须挂在命令泵上（每 0.2s 一拍）。"""
+        import inspect
+        src = inspect.getsource(self.main.WirelessStatusApp._start_pump)
+        self.assertIn("_poll_taskbar_change", src)
+
+    def test_rebuild_recreates_window(self):
+        """重建必须真的造一个新窗口（老的 HWND 已随任务栏没了）。"""
+        import inspect
+        src = inspect.getsource(self.main.WirelessStatusApp._rebuild_pill_window)
+        self.assertIn("_create_pill_window", src)
+        self.assertIn("_set_pill_visible", src)
+
+    def test_embed_respects_visibility(self):
+        """开关关着时贴片不能被 SWP_SHOWWINDOW 闪一下。"""
+        import inspect
+        src = inspect.getsource(self.main.WirelessStatusApp._apply_pill_host)
+        self.assertIn("show=show", src)
+        self.assertIn("_pill_enabled", src)
+
+    def test_winui_embed_supports_show_flag(self):
+        """winui.embed_in_taskbar 要认 show 参数（False 时不带 SWP_SHOWWINDOW）。"""
+        import inspect
+        import winui
+        src = inspect.getsource(winui.embed_in_taskbar)
+        self.assertIn("show=True", src)
+        self.assertIn("SWP_SHOWWINDOW", src)
 
 
 class TestPillFlatStyle(unittest.TestCase):

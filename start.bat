@@ -81,10 +81,23 @@ Run:  python -m pip install pywin32"
 )
 
 rem ---- 4. launch ---------------------------------------------------
-rem "start "" ..." detaches, so this cmd exits immediately and no console
-rem lingers. The GUI process owns its own (invisible) window.
-echo [%DATE% %TIME%] launching %PYW% main.py >> "%LOGFILE%"
-start "" "%PYW%" "%~dp0main.py"
+rem Prefer the DETACHED launch (launcher.py --start): it uses Task
+rem Scheduler, so the GUI process's parent is svchost instead of us.
+rem
+rem Why this matters: when this .bat is run from a terminal that lives
+rem inside a Job Object (e.g. the DSH terminal), a normally-started child
+rem is killed the moment that Job is closed - the program then "vanishes
+rem for no reason". Detached launch is immune to that.
+rem
+rem Fallback (detached unavailable): plain "start" - it detaches from
+rem this cmd so no console lingers, but it stays inside the caller's Job.
+echo [%DATE% %TIME%] launching detached (launcher.py) >> "%LOGFILE%"
+"%PYW%" "%~dp0launcher.py" --start >> "%LOGFILE%" 2>&1
+if errorlevel 1 (
+  echo [%DATE% %TIME%] WARN detached launch failed, falling back to plain start >> "%LOGFILE%"
+  echo [%DATE% %TIME%] launching %PYW% main.py >> "%LOGFILE%"
+  start "" "%PYW%" "%~dp0main.py" --silent
+)
 
 exit /b 0
 

@@ -305,7 +305,44 @@ def taskbar_hwnd():
         return 0
 
 
-def embed_in_taskbar(hwnd, x, y, w, h):
+#: ``embed_in_taskbar`` 上一次失败的原因（成功时置空）。
+#:
+#: 为什么要有：``embed_in_taskbar`` 只会返回 True/False，而它内部有四个
+#: 失败点（拿不到任务栏 / SetParent 失败 / 拿不到任务栏矩形 / 异常）。
+#: 只看 False 根本不知道卡在哪一步 —— 排查"贴片没挂进任务栏"时无从下手。
+#: 主程序读它写进生命周期日志。
+LAST_EMBED_ERROR = ""
+
+
+def window_style(hwnd):
+    """取窗口的样式位（只用于排查）。取不到返回 0。"""
+    if not IS_WINDOWS or not hwnd:
+        return 0
+    try:
+        import ctypes
+        return int(ctypes.windll.user32.GetWindowLongW(
+            ctypes.c_void_p(hwnd), -16) & 0xFFFFFFFF)
+    except Exception:
+        return 0
+
+
+def window_parent(hwnd):
+    """取窗口的父窗口句柄；取不到返回 0。
+
+    用于**确认** ``SetParent`` 真的生效了 —— ``SetParent`` 的返回值是
+    "旧父窗口"，旧父是 NULL 时它返回 0，那是"原来没有父"而不是失败，
+    根本不能拿来判断成功与否。看 ``GetParent`` 的**当前值**才准。
+    """
+    if not IS_WINDOWS or not hwnd:
+        return 0
+    try:
+        import ctypes
+        return int(ctypes.windll.user32.GetParent(ctypes.c_void_p(hwnd)) or 0)
+    except Exception:
+        return 0
+
+
+def embed_in_taskbar(hwnd, x, y, w, h, show=True):
     """把贴片窗 ``SetParent`` 挂成任务栏的子窗口。
 
     参数 ``x, y, w, h`` 是**任务栏客户区坐标系**下的物理像素。
@@ -315,13 +352,20 @@ def embed_in_taskbar(hwnd, x, y, w, h):
     任务栏被开始菜单盖住时它仍然露在上面。挂成子窗口之后它就跟输入法
     候选框、时钟一样，属于任务栏本身。
 
+    ``show=False`` 时**不**带 ``SWP_SHOWWINDOW``：贴片开关关着的时候要
+    建好窗口但别让它闪一下（窗口同生共死，见 main._create_pill_window）。
+
     返回 True/False。失败时调用方必须退回 ``place_over_taskbar``
     （置顶浮窗），**不许**静默什么都不做。
     """
+    global LAST_EMBED_ERROR
+    LAST_EMBED_ERROR = ""
     if not IS_WINDOWS or not hwnd:
+        LAST_EMBED_ERROR = "句柄无效"
         return False
     host = taskbar_hwnd()
     if not host:
+        LAST_EMBED_ERROR = "找不到 Shell_TrayWnd"
         return False
     try:
         import ctypes
@@ -334,24 +378,36 @@ def embed_in_taskbar(hwnd, x, y, w, h):
         style = (style & ~WS_POPUP) | WS_CHILD | WS_CLIPCHILDREN
         user32.SetWindowLongW(ctypes.c_void_p(hwnd), GWL_STYLE, style)
 
-        if not user32.SetParent(ctypes.c_void_p(hwnd), ctypes.c_void_p(host)):
+        # SetParent 返回的是**旧父窗口**。旧父是 NULL（顶层窗口）时它返回
+        # 0 —— 那不是失败，是"原来没有父"！所以这里不能只看返回值真假，
+        # 得看 GetParent 是不是真的换成了任务栏。
+        prev = user32.SetParent(ctypes.c_void_p(hwnd), ctypes.c_void_p(host))
+        now = user32.GetParent(ctypes.c_void_p(hwnd))
+        if now != host:
+            LAST_EMBED_ERROR = ("SetParent 未生效（prev=%s now=%s host=%s）"
+                               % (prev, now, host))
             return False
 
         # 子窗口用**客户区坐标**，相对任务栏左上角。
         bar = taskbar_rect()
         if not bar:
+            LAST_EMBED_ERROR = "拿不到任务栏矩形"
             return False
+        flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED
+        if show:
+            flags |= SWP_SHOWWINDOW
         user32.SetWindowPos(
             ctypes.c_void_p(hwnd), None,
             int(x - bar[0]), int(y - bar[1]),
             max(1, int(w)), max(1, int(h)),
-            SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_SHOWWINDOW)
+            flags)
         return True
-    except Exception:
+    except Exception as exc:
+        LAST_EMBED_ERROR = "%s: %s" % (type(exc).__name__, exc)
         return False
 
 
-def detach_from_taskbar(hwnd, x, y, w, h):
+def detach_from_taskbar(hwnd, x, y, w, h, show=True):
     """把贴片窗从任务栏上摘下来，恢复成独立无边框浮窗（降级路径）。
 
     参数 ``x, y, w, h`` 是**屏幕坐标**物理像素。返回 True/False。
@@ -367,10 +423,13 @@ def detach_from_taskbar(hwnd, x, y, w, h):
         style = user32.GetWindowLongW(ctypes.c_void_p(hwnd), GWL_STYLE)
         style = (style & ~WS_CHILD) | WS_POPUP
         user32.SetWindowLongW(ctypes.c_void_p(hwnd), GWL_STYLE, style)
+        flags = SWP_NOACTIVATE | SWP_FRAMECHANGED
+        if show:
+            flags |= SWP_SHOWWINDOW
         user32.SetWindowPos(
             ctypes.c_void_p(hwnd), -1,          # HWND_TOPMOST
             int(x), int(y), max(1, int(w)), max(1, int(h)),
-            SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_SHOWWINDOW)
+            flags)
         return True
     except Exception:
         return False
@@ -901,8 +960,15 @@ def pill_rect_in_taskbar(pill_width, pill_height):
     """
     bar = taskbar_rect()
     note = notify_area_rect()
-    if not bar or not note:
+    if not bar:
         return None
+    if not note:
+        # 通知区（``TrayNotifyWnd``）**还不存在** —— explorer 刚重启的
+        # 那几秒里就是这样。以前这里直接 return None，贴片就永远挂不上
+        # 任务栏（表现：explorer 一重启，贴片变成飘在桌面上的顶层窗口，
+        # 而且再也回不去了）。现在退回"贴任务栏最右端"，至少能挂上，
+        # 等通知区出现后 ``_poll_taskbar_change`` 会再摆正一次。
+        note = (bar[2], bar[1], bar[2], bar[3])
     bar_left, bar_top, bar_right, bar_bottom = bar
     bar_h = bar_bottom - bar_top
     if bar_h <= 0:

@@ -264,6 +264,29 @@ def _setup_logging():
         pass
 
 
+#: 生命周期日志文件名（放在程序目录，和 error.log / ui_error.log 并排）。
+#:
+#: 为什么单独开一个文件：
+#:   * ``ui_error.log`` 混着托盘/WebView2 的噪声；
+#:   * ``error.log`` 只在 Python 抛异常时才有内容 —— 而"程序莫名其妙没了"
+#:     这类问题**根本没有异常**（进程是被结束或走完流程退出的）；
+#:   * ``window_state.json`` 用户拖窗口时也会写，和退出没法区分。
+#:
+#: 排查"它怎么没的"需要的是一条**时间线**：什么时候起来的、贴片建了没、
+#: 任务栏变没变、最后是怎么走的。单独一个文件最好读。
+LIFECYCLE_LOG_NAME = "lifecycle.log"
+
+
+def _lifecycle(text):
+    """写一行生命周期日志。写失败也绝不影响主流程。"""
+    try:
+        path = os.path.join(apppath.app_dir(), LIFECYCLE_LOG_NAME)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write("[%s] %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), text))
+    except Exception:
+        pass
+
+
 def dpi_scale():
     """当前主屏缩放倍率（1.0 / 1.25 / 1.5 / 2.0…）。失败返回 1.0。
 
@@ -468,7 +491,7 @@ class Api(object):
         return self._app.taskbar_metrics()
 
     def quit(self):
-        return self._app.quit()
+        return self._app.quit("界面退出按钮")
 
     def status(self):
         return self._app.status()
@@ -607,6 +630,14 @@ class WirelessStatusApp(object):
         self._pill_tip_sig = None
         #: 「第二个实例请我显示窗口」的命名事件句柄（见 _poll_post_message）
         self._wake_event = None
+        #: 贴片当前**是否显示**。窗口本身一直存在（同生共死），这个开关
+        #: 只控制显隐。
+        self._pill_enabled = bool(
+            (self.store.config or {}).get("battery_pill_enabled"))
+        #: 当前任务栏窗口句柄。变了 = explorer 重启过，贴片要重建
+        self._taskbar_hwnd_seen = None
+        #: 上次尝试重挂贴片的时间（后台自愈限速用，2 秒一次）
+        self._pill_retry_at = 0.0
 
     # ---------------------------------------------------------------- 启动
 
@@ -676,18 +707,31 @@ class WirelessStatusApp(object):
             hidden=not self._show_at_start,
         )
 
-        # ---- 贴片窗：极小、不可拖动、不占任务栏
-        if self.store.config.get("battery_pill_enabled"):
-            self._create_pill_window(url)
+        # ---- 贴片窗：**总是**创建，跟主窗同生共死（见 _create_pill_window）
+        #
+        # 需求（用户原话）：「贴片就应该跟着主窗一样开启一起退出」。
+        # 以前是"开关关就销毁窗口"，那有两个害处：
+        #   1. 销毁 pywebview 窗口会走到它的 ``on_close`` → 全部窗口都没了
+        #      就 ``Application.Exit()``，理论上能把整个程序带走；
+        #   2. 贴片窗是任务栏的**子窗口**，随时可能被系统销毁（explorer
+        #      重启），销毁后 pywebview 那边留下一堆僵尸状态。
+        # 现在改成：窗口只建一次，之后开关只控制**显示 / 隐藏**。
+        self._create_pill_window(url)
 
         # 唤醒事件：第二个实例带 --show 时会 SetEvent，命令泵负责转成
         # show_window()（见 _poll_post_message）。放在 _start_pump 之前，
         # 免得第一拍轮询时句柄还是 None。
         self._wake_event = self._open_wake_event()
 
+        # 记下当前任务栏句柄：变了就说明 explorer 重启过，贴片要重建
+        self._taskbar_hwnd_seen = winui.taskbar_hwnd()
+
         self._start_pump()
+        _lifecycle("进入 GUI 消息循环（主窗可见=%s，贴片启用=%s）"
+                   % (self._show_at_start, self._pill_enabled))
         try:
             webview.start(self._after_start, gui="edgechromium", debug=False)
+            _lifecycle("GUI 消息循环已结束（说明有窗口被关闭，pywebview 退出）")
         finally:
             self.shutdown()
 
@@ -723,7 +767,24 @@ class WirelessStatusApp(object):
         self.post("show")
 
     def _create_pill_window(self, base_url):
+        """创建贴片窗。**只建一次**，之后开关只控制显示 / 隐藏。
+
+        为什么"只建一次"（用户需求：贴片跟主窗一样开启、一起退出）：
+
+        * 贴片窗是 ``Shell_TrayWnd`` 的**子窗口**，随时可能被系统销毁
+          （explorer 重启）。销毁之后 pywebview 那边会留下一个死掉的
+          Window 对象，再去 destroy 它会抛异常；
+        * 销毁 pywebview 窗口会走到它的 ``on_close`` → 所有窗口都没了就
+          ``Application.Exit()``，理论上能把整个程序带走；
+        * 开关的语义本来就只是"要不要在任务栏上显示这一行"，不是"要不要
+          存在一个窗口"。
+
+        所以：窗口跟着主窗一起建、一起退；开关只切 ``ShowWindow``。
+        """
         import webview
+        if self.pill_window is not None:
+            # 已经建过了（任务栏重建后的自愈走另一条路），不重复建
+            return self.pill_window
         pw, ph, px, py = self.pill_rect()
         try:
             self.pill_window = webview.create_window(
@@ -759,6 +820,10 @@ class WirelessStatusApp(object):
                 focus=False,
                 shadow=False,
                 text_select=False,
+                # 开关关着时**先藏起来**：窗口照建（同生共死），只是不显示。
+                # hidden=True 让 pywebview 建完就 Hide()，之后我们靠
+                # _set_pill_visible() 控制显隐。
+                hidden=not self._pill_enabled,
             )
             # 立刻去任务栏按钮：等 _apply_window_chrome 的话，窗口已经
             # 在任务栏闪了一下图标才消失（需求 2 明确说「开启后会在任务栏
@@ -766,7 +831,11 @@ class WirelessStatusApp(object):
             try:
                 ph_hwnd = winui.window_handle(self.pill_window)
                 if not ph_hwnd:
-                    ph_hwnd = self._window_hwnd(PILL_TITLE, timeout=1.5)
+                    # **运行期创建的窗口**（任务栏重建后的自愈）拿不到句柄：
+                    # pywebview 把建窗动作 Marshal 到 UI 线程排队执行，这里
+                    # 立刻去问当然是 None。必须等 —— 找不到句柄就挂不上任务栏，
+                    # 贴片会变成一个飘在桌面上的顶层窗口。
+                    ph_hwnd = self._window_hwnd(PILL_TITLE, timeout=5.0)
                 if ph_hwnd:
                     self._hwnd_cache["pill"] = ph_hwnd
                     winui.hide_from_taskbar(ph_hwnd,
@@ -777,11 +846,154 @@ class WirelessStatusApp(object):
                     # 失败会自动退回置顶浮窗并把原因写进 _pill_error。
                     self._apply_pill_host()
                 self._ensure_tip_window()
+                _lifecycle("贴片窗已创建（显示=%s）" % self._pill_enabled)
             except Exception:
                 traceback.print_exc()
         except Exception:
             traceback.print_exc()
             self._pill_error = "贴片窗口创建失败"
+        return self.pill_window
+
+    def _set_pill_visible(self, on):
+        """显示 / 隐藏贴片窗。**不销毁、不重建**（同生共死）。
+
+        隐藏用 ``ShowWindow(SW_HIDE)``：贴片是任务栏的子窗口，隐藏它
+        既不会挡住任务栏点击，也不会留下任何残影。
+
+        返回是否成功。
+        """
+        hwnd = self._pill_hwnd()
+        if not hwnd:
+            return False
+        try:
+            if on:
+                # 重新挂一次宿主：任务栏重建后可能被摘成浮窗，或者位置过时
+                self._apply_pill_host()
+                winui.show_window(hwnd)
+            else:
+                winui.hide_window(hwnd)
+            _lifecycle("贴片%s" % ("显示" if on else "隐藏"))
+            return True
+        except Exception:
+            traceback.print_exc()
+            return False
+
+    def _poll_taskbar_change(self):
+        """任务栏被重建（explorer 重启）后重建贴片窗；贴片掉了也会重挂。
+
+        为什么需要：贴片窗是 ``Shell_TrayWnd`` 的**子窗口**。explorer 一重启
+        （Windows 更新、装软件、某些优化工具都会触发），老任务栏连同它的
+        子窗口一起销毁 —— 贴片就这么永久消失了，看起来像"程序崩了"。
+
+        判据是**任务栏窗口句柄变了**：句柄变 = explorer 换了一个任务栏。
+        句柄没变就什么都没发生（任务栏自动隐藏、通知区弹出都不改句柄）。
+
+        重建 = 重新建一个 pywebview 窗口再挂上去。运行期调
+        ``webview.create_window`` 是安全的：pywebview 会把实际的窗体创建
+        Marshal 到 UI 线程做（``guilib.create_window`` → ``i.Invoke``），
+        且我们的 URL 是 ``http://127.0.0.1:...``，``is_local_url`` 对它返回
+        False，不会误启它自己那套本地服务器。
+
+        顺带做**后台自愈**：贴片建好时 .NET 那边可能还在建窗体（它建完
+        会 Show()，把 WS_CHILD 撤掉、父窗口退回 NULL），或者任务栏刚起来
+        通知区（``TrayNotifyWnd``）还没出现导致第一次挂载失败。这里每次
+        都核对一下"贴片现在还挂在任务栏上吗"，没有就重挂 —— 限速 2 秒
+        一次，不占用命令泵。
+        """
+        hwnd = winui.taskbar_hwnd()
+        if not hwnd:
+            return
+        seen = getattr(self, "_taskbar_hwnd_seen", None)
+        if seen != hwnd:
+            self._taskbar_hwnd_seen = hwnd
+            if seen is not None:
+                _lifecycle("检测到任务栏被重建（%s -> %s），重建贴片窗"
+                           % (seen, hwnd))
+                try:
+                    self._rebuild_pill_window()
+                except Exception:
+                    traceback.print_exc()
+                return
+
+        # ---- 后台自愈：贴片没挂在任务栏上、或者位置该变了，就重挂一次
+        #
+        # 两种情况都要管：
+        #   * **父窗口不对** —— .NET 建完窗体 Show() 时把 WS_CHILD 撤了，
+        #     或者第一次挂载时通知区还没出现导致几何读不到；
+        #   * **位置不对** —— 任务栏重建后通知区（``TrayNotifyWnd``）要过
+        #     几秒才出现。挂载时只能退回"贴任务栏最右端"，等通知区出现后
+        #     贴片得往左挪，否则会压在时钟上。
+        #
+        # 限速 2 秒一次，不占用命令泵。
+        if not getattr(self, "_pill_enabled", False):
+            return
+        pill = self._pill_hwnd()
+        if not pill:
+            return
+        parent_ok = winui.window_parent(pill) == hwnd
+        geom = None
+        try:
+            geom = winui.pill_rect_in_taskbar(
+                int(getattr(self, "_pill_width", PILL_WIDTH)), PILL_HEIGHT)
+        except Exception:
+            geom = None
+        want = tuple(geom[:4]) if geom else None
+        pos_ok = want is not None and tuple(
+            getattr(self, "_pill_geom", None) or ()) == want
+        if parent_ok and pos_ok:
+            return
+        now = time.time()
+        if now - getattr(self, "_pill_retry_at", 0.0) < 2.0:
+            return
+        self._pill_retry_at = now
+        _lifecycle("贴片需要重新挂载（parent 正确=%s 位置正确=%s）"
+                   % (parent_ok, pos_ok))
+        try:
+            self._apply_pill_host()
+        except Exception:
+            traceback.print_exc()
+
+    def _rebuild_pill_window(self):
+        """任务栏重建后重新造一个贴片窗。
+
+        老窗口的 HWND 已经随老任务栏没了，pywebview 那边是个死对象 ——
+        先把它从 pywebview 的窗口表里摘掉（``destroy`` ���能抛，忽略），
+        再建一个新的。
+        """
+        old = self.pill_window
+        self.pill_window = None
+        self._hwnd_cache.pop("pill", None)
+        self._pill_embedded = False
+        self._pill_geom = None
+        try:
+            if old is not None:
+                old.destroy()
+        except Exception:
+            pass
+        url = self.httpd.url if self.httpd else ""
+        if not url:
+            _lifecycle("贴片重建失败：本地服务还没起来")
+            return
+        self._create_pill_window(url)
+
+        # 再等一次句柄并补挂宿主：运行期建的窗口，句柄可能比 create_window
+        # 返回稍晚才就绪。挂不上任务栏的话贴片就是个飘在桌面上的顶层窗，
+        # 位置和层级都不对（也不会跟着任务栏隐藏）。
+        hwnd = self._pill_hwnd() or self._window_hwnd(PILL_TITLE, timeout=5.0)
+        if hwnd:
+            self._hwnd_cache["pill"] = hwnd
+            try:
+                winui.hide_from_taskbar(hwnd, self._main_hwnd() or None)
+            except Exception:
+                pass
+            self._apply_pill_host()
+            _lifecycle("贴片已重新挂到新任务栏（hwnd=%s parent=%s）"
+                       % (hwnd, winui.window_parent(hwnd)))
+        else:
+            _lifecycle("贴片重建后没拿到窗口句柄，贴片可能没挂上任务栏")
+
+        # 建完按当前开关决定显示还是隐藏
+        self._set_pill_visible(self._pill_enabled)
 
     def _ensure_tip_window(self):
         """按需创建悬停提示窗（独立线程，见 tipwindow.py）。
@@ -987,6 +1199,10 @@ class WirelessStatusApp(object):
                         self._poll_pill_hover()
                     except Exception:
                         pass
+                    try:
+                        self._poll_taskbar_change()
+                    except Exception:
+                        pass
                     continue
                 try:
                     self._run_command(cmd)
@@ -1003,6 +1219,10 @@ class WirelessStatusApp(object):
                     pass
                 try:
                     self._poll_pill_hover()
+                except Exception:
+                    pass
+                try:
+                    self._poll_taskbar_change()
                 except Exception:
                     pass
         t = threading.Thread(target=loop, name="cmd-pump", daemon=True)
@@ -1298,7 +1518,7 @@ class WirelessStatusApp(object):
         elif cmd == "autostart":
             self.set_autostart(not autostart.is_enabled())
         elif cmd == "quit":
-            self.quit()
+            self.quit("托盘菜单")
 
     # ---------------------------------------------------------------- 窗口
 
@@ -1469,10 +1689,14 @@ class WirelessStatusApp(object):
         """
         hwnd = self._pill_hwnd()
         if not hwnd:
+            _lifecycle("贴片挂宿主失败：拿不到窗口句柄")
             return False
         geom = winui.pill_rect_in_taskbar(
             int(getattr(self, "_pill_width", PILL_WIDTH)), PILL_HEIGHT)
         if not geom:
+            # 任务栏刚重建、通知区还没出现时会走到这里。以前是静默 return，
+            # 贴片就永远挂不上任务栏（explorer 一重启就变成顶层浮窗）。
+            _lifecycle("贴片挂宿主失败：读不到任务栏几何")
             self._pill_error = "任务栏几何读取失败，贴片退回浮窗模式"
             self._pill_embedded = False
             return False
@@ -1481,10 +1705,32 @@ class WirelessStatusApp(object):
         # 记下贴片自己的物理矩形，前端采样任务栏底色时按它取邻域
         self._pill_geom = (x, y, w, h)
 
+        # 开关关着的时候**不要**把窗口显示出来（窗口同生共死，只是藏着）。
+        # show=False 时 embed 不带 SWP_SHOWWINDOW，不会闪一下。
+        show = bool(getattr(self, "_pill_enabled", True))
+
         # 先改几何、再裁形状。顺序不能反：``SetWindowRgn`` 的坐标是**窗口
         # 坐标**，窗口随后被 SetWindowPos 改大改小时区域**不会跟着缩放** ——
         # 先裁就会按旧尺寸裁，出现「右边缺一块」或「胶囊比窗口窄一截」。
-        ok = winui.embed_in_taskbar(hwnd, x, y, w, h)
+        ok = winui.embed_in_taskbar(hwnd, x, y, w, h, show=show)
+        if not ok:
+            _lifecycle("贴片挂任务栏失败：%s" % (winui.LAST_EMBED_ERROR or "未知原因"))
+
+        # **必须确认父窗口真的换成了任务栏**，返回 True 不算数。
+        #
+        # ``SetParent`` 的返回值是"旧父窗口"，旧父为 NULL 时它返回 0 ——
+        # 那是"原来没有父"而不是失败，所以只能看 ``GetParent`` 的**当前值**
+        # （winui.embed_in_taskbar 内部也是这么判的）。
+        #
+        # 这里确认完如果还不对，**不阻塞重试** —— 交给命令泵里的
+        # ``_poll_taskbar_change`` 每 2 秒重挂一次。之所以要后台重试：
+        # 运行期创建的窗口，.NET 那边是**异步**建窗体的，它建完会 Show()，
+        # 而 Show() 会重新应用窗体自己的 top-level 样式，把我们刚设的
+        # WS_CHILD 撤掉、父窗口退回 NULL。那一刻我们还没挂上，只能等它
+        # 之后再挂 —— 而等待不该占着命令泵。
+        if ok and winui.window_parent(hwnd) != winui.taskbar_hwnd():
+            ok = False
+            _lifecycle("贴片挂上后父窗口仍不是任务栏，交给后台自愈重挂")
         if ok:
             self._pill_embedded = True
             self._pill_bar_height = bar_h
@@ -1497,7 +1743,7 @@ class WirelessStatusApp(object):
         self._pill_bar_height = bar_h
         try:
             winui.set_noactivate(hwnd)
-            winui.detach_from_taskbar(hwnd, x, y, w, h)
+            winui.detach_from_taskbar(hwnd, x, y, w, h, show=show)
             winui.clip_round_rect(hwnd, PILL_RADIUS)
             self._pill_error = (
                 "贴片未能嵌入任务栏（SetParent 被系统拒绝），"
@@ -1670,9 +1916,27 @@ class WirelessStatusApp(object):
         self._restore_visibility()
 
     def _pill_hwnd(self):
-        if self.pill_window is None:
-            return None
-        return winui.window_handle(self.pill_window)
+        """贴片窗的 HWND。
+
+        **拿不到 pywebview 的 native 句柄时必须退回句柄缓存**。
+
+        为什么：运行期创建的窗口（任务栏重建后的自愈），
+        ``window.native`` 要等 UI 线程那边真的把窗体建出来才填上 ——
+        立刻去问是 None。而我们其实已经通过 ``FindWindow`` 按标题拿到过
+        句柄（见 ``_create_pill_window`` / ``_rebuild_pill_window``），
+        存在 ``_hwnd_cache["pill"]`` 里。
+
+        少了这个回退，``_apply_pill_host()`` 会在第一行就 return False ——
+        贴片永远挂不上任务栏，变成一个飘在桌面上的顶层窗口（位置对、
+        层级不对、也不会跟着任务栏隐藏）。实测就是这么发现的：
+        自愈日志写着"已重新挂到新任务栏"，实际 parent=0。
+        """
+        if self.pill_window is not None:
+            hwnd = winui.window_handle(self.pill_window)
+            if hwnd:
+                return hwnd
+        # 回退到缓存（句柄可能已经随老任务栏失效，但比没有强）
+        return self._hwnd_cache.get("pill")
 
     def open_window(self):
         """显示主窗（贴片点击、托盘左键、第二次启动都走这里）。"""
@@ -1904,16 +2168,21 @@ class WirelessStatusApp(object):
             winui.hide_window(hwnd)
         return {"ok": True}
 
-    def quit(self):
+    def quit(self, source="unknown"):
         """真退出：停采集、删托盘图标、销毁窗口、结束进程。
 
         顺序很重要：先销毁窗口（webview.start 会在窗口销毁后返回），
         再删托盘图标。反过来的话，托盘图标先没了、窗口却还开着几百毫秒，
         用户会看到「图标消失但窗口还在」。
+
+        ``source`` 是退出请求的来源（托盘菜单 / 界面按钮 / API），
+        写进生命周期日志 —— 排查"它怎么没的"时能分清是**用户主动退**还是
+        **自己退掉的**。
         """
         if self._quitting:
             return {"ok": True}
         self._quitting = True
+        _lifecycle("收到退出请求（来源：%s）" % source)
         self.persist_geometry()
         # 贴片窗先关，否则主窗销毁后 webview 退出时它可能还挂着。
         # 走 _destroy_pill_window 而不是裸 destroy()：它会把句柄缓存一起清掉，
@@ -1930,6 +2199,13 @@ class WirelessStatusApp(object):
         return {"ok": True}
 
     def shutdown(self):
+        """收尾：停采集、删托盘图标、停服务。
+
+        这里会写一行生命周期日志 —— 排查"程序怎么没的"时，**这一行是
+        最重要的证据**：它出现 = 程序是走完流程正常退出的（不是被杀、
+        不是崩溃）；它没出现 = 进程是被外部干掉的（那就要去查是谁杀的）。
+        """
+        _lifecycle("进入 shutdown（收尾中）")
         self._pump_stop.set()
         self.persist_geometry()
         if self._tip is not None:
@@ -1954,6 +2230,7 @@ class WirelessStatusApp(object):
             pass
         if self.httpd is not None:
             self.httpd.stop()
+        _lifecycle("shutdown 完成，进程即将结束")
 
     # ---- 几何（只写不读，见 main_rect 的注释）
 
@@ -2181,29 +2458,33 @@ class WirelessStatusApp(object):
             return False
 
     def set_pill_enabled(self, on):
-        """贴片开关：立刻生效（建/销毁窗口）并持久化。
+        """贴片开关：立刻生效并持久化。
 
         需求第 3 条：贴片由这个开关**独占控制** —— 打开后一直显示，没有任何
-        定时/超时隐藏；唯一的关闭入口就是这个开关和退出程序。所以这里
-        没有也不需要「空闲多少秒自动关」的逻辑。
+        定时/超时隐藏；唯一的关闭入口就是这个开关和退出程序。
+
+        实现上只做**显示 / 隐藏**，**不销毁窗口**（用户需求：贴片跟主窗
+        一样开启、一起退出）。理由：
+          * 销毁 pywebview 窗口会走它的 ``on_close`` → 所有窗口都没了就
+            ``Application.Exit()``，理论上能把整个程序带走；
+          * 贴片是任务栏的**子窗口**，随时可能被系统销毁（explorer 重启），
+            销毁重建留下一堆僵尸状态；
+          * 开关的语义本来就只是"要不要在任务栏上显示这一行"。
         """
         on = bool(on)
         self.store.set_config("battery_pill_enabled", on)
+        self._pill_enabled = on
         try:
-            if on:
-                if self.pill_window is None:
-                    url = self.httpd.url if self.httpd else ""
+            if self.pill_window is None:
+                # 极端情况：贴片窗还没建出来（创建失败）。补建一个。
+                url = self.httpd.url if self.httpd else ""
+                if url:
                     self._create_pill_window(url)
-                    # 新建窗口后要补一次窗口装饰
-                    self._apply_window_chrome()
-                    self._reposition()
-            else:
-                if self.pill_window is not None:
-                    self._destroy_pill_window()
+            self._set_pill_visible(on)
         except Exception as exc:
             traceback.print_exc()
             return {"ok": False, "enabled": on,
-                    "error": "贴片窗口切换失败：%s" % exc}
+                    "error": "贴片显示状态切换失败：%s" % exc}
         return {"ok": True, "enabled": on}
 
     def _destroy_pill_window(self):
@@ -2458,6 +2739,7 @@ def _report_fatal(exc, silent=False):
     用户之后能查。
     """
     detail = traceback.format_exc()
+    _lifecycle("启动异常：%s: %s" % (type(exc).__name__, exc))
     try:
         log = os.path.join(apppath.app_dir(), "error.log")
         with open(log, "a", encoding="utf-8") as fh:
@@ -2479,6 +2761,8 @@ def _report_fatal(exc, silent=False):
 
 def main():
     show_at_start, silent = _parse_args(sys.argv[1:])
+    _lifecycle("进程启动 pid=%d argv=%r show=%s silent=%s"
+               % (os.getpid(), sys.argv, show_at_start, silent))
 
     handle = acquire_single_instance()
     if handle is None:
@@ -2487,6 +2771,7 @@ def main():
         #   * 其余（含开机自启的 --silent）：直接退出，什么都不做。
         # 老代码在唤窗失败时还会弹一个「已经在运行了」的系统对话框，
         # 开机时第二个实例必然走到那一支 —— 就是那个弹窗的来源。
+        _lifecycle("检测到已有实例在跑（单实例锁被占），本次进程退出")
         if show_at_start:
             wake_existing()
         return 0

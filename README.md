@@ -136,6 +136,25 @@ python main.py --show
 > 不带 `--show` 时，重复启动**什么都不做**（不弹窗、不唤窗、不报错）。
 > 开机自启从来不带 `--show`，所以开机时不会自己弹出任何窗口。
 
+### 从 DSH 终端启动会跟着 DSH 一起退出 —— 用 launcher
+
+在 DSH（DeepSeek Harness）的终端里直接跑 `python main.py`，进程会落在 DSH 的
+**Job Object** 里；DSH 一关，那个 Job 被关闭，进程**跟着被杀**。用户看到的
+现象就是"程序莫名其妙闪退"，而且退出时机和 DSH 完全一致。
+
+`start.bat` 已经改成走脱离通道（`launcher.py --start`）：它用 **Task
+Scheduler** 拉起进程，父进程是 `svchost`，不在调用者的进程树里，所以：
+
+* 从 DSH 终端、CMD、PowerShell、IDE 里启动都**不会**被连带杀掉；
+* 手动执行也行：
+
+```bat
+python launcher.py --start          :: 脱离启动（静默）
+python launcher.py --start --show   :: 脱离启动并直接显示窗口
+```
+
+> 开机自启（`HKCU\...\Run`）由 explorer 拉起，本来就独立于 DSH，不受影响。
+
 ### 重新生成图标
 
 ```bat
@@ -297,7 +316,8 @@ wireless-status/
   tray.py             系统托盘（独立线程 + 消息泵）
   autostart.py        开机自启（HKCU Run，带 --silent，清理重复项）
   apppath.py          路径解析与四个 json 的读写
-  selftest.py         离线自测（175 项）
+  selftest.py         离线自测（206 项）
+  launcher.py         脱离 Job Object 的启动通道（Task Scheduler）
   web/                前端（index.html / app.js / style.css + 贴片三件套）
   icon/               应用图标 + 设备类型图标（mouse/keyboard/headset/gamepad）
   tools/make_icon.py  应用图标生成脚本（环形电量表，多尺寸 ico）
@@ -317,6 +337,8 @@ wireless-status/
 ## 已知限制
 
 * 只支持走 USB 接收器的 HID++ 2.0 设备，蓝牙直连与有线直连未对接。
+* 贴片窗是**任务栏的子窗口** —— explorer 一重启它就会被连带销毁。程序会
+  自动检测并重建（见 `docs/REFERENCE.md`），但重建的那一两秒里贴片是空的。
 * 只有电压特性（`0x1001`）的设备显示「不支持」—— 电压换算百分比各机型不一致，
   硬换算出来的数字是骗人的。
 * 使用时长统计的是**全系统的键鼠动作**，不是某只设备自己的传感器数据

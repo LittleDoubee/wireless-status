@@ -30,3 +30,6 @@ _probe.txt
 docs/images/
 node_modules/
 node_modules.orig/
+
+# 生命周期日志（每次启动都写，不进版本库）
+lifecycle.log

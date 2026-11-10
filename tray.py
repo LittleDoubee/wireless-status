@@ -142,6 +142,14 @@ class TrayIcon(object):
         except Exception:
             traceback.print_exc()
         finally:
+            # 托盘线程退出 = 托盘图标没了，但**主程序还在跑**（用户还能用
+            # 界面）。这一行写进生命周期日志：排查"托盘图标怎么不见了"时，
+            # 能一眼看出是托盘线程自己退了，还是整个程序都没了。
+            try:
+                import main as _main
+                _main._lifecycle("托盘线程退出（图标已移除，主程序仍在运行）")
+            except Exception:
+                pass
             self._remove_icon()
             if self._need_destroy_icon and self._hicon:
                 try:
